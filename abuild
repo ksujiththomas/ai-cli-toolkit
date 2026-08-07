@@ -26,7 +26,6 @@ echo -e "\n==================================================="
 echo " PHASE 1: Architecting System & File Tree"
 echo -e "===================================================\n"
 
-# Step 1: Architect prompt - output STRICT JSON array of files to create
 ARCH_PROMPT="You are a Lead Software Architect.
 Decompose this project into discrete, modular code files.
 OUTPUT ONLY VALID JSON raw array with no markdown formatting or extra text.
@@ -46,10 +45,8 @@ $ARCH_PROMPT
 INSIDE_HEREDOC
 )
 
-# Clean json output from model
 CLEAN_JSON=$(echo "$RAW_PLAN" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```json//g; s/```//g' | tr -d '\r')
 
-# Validate JSON parsing using python3
 if ! echo "$CLEAN_JSON" | python3 -m json.tool >/dev/null 2>&1; then
     echo "Error: Architect failed to generate valid JSON plan."
     echo "Raw output was:"
@@ -61,12 +58,11 @@ FILE_COUNT=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(len(json.l
 echo "Architect generated a $FILE_COUNT-file plan."
 
 echo -e "\n==================================================="
-echo " PHASE 2: Autonomous Code Building Loop (with Context)"
+echo " PHASE 2: Autonomous Code Building Loop (with Safety Controls)"
 echo -e "===================================================\n"
 
 ACCUMULATED_CONTEXT=""
 
-# Step 2: Loop through every file, pass cumulative context, generate code & save
 for (( i=0; i<$FILE_COUNT; i++ )); do
     FILE_PATH=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)[$i]['path'])")
     FILE_DESC=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)[$i]['description'])")
@@ -76,7 +72,6 @@ for (( i=0; i<$FILE_COUNT; i++ )); do
     echo "Purpose: $FILE_DESC"
     echo "---------------------------------------------------"
 
-    # Make parent directory if it doesn't exist
     mkdir -p "$(dirname "$FILE_PATH")"
 
     BUILD_PROMPT="You are a Senior Developer. Write the FULL, PRODUCTION-READY implementation for the following file:
@@ -86,32 +81,28 @@ Requirements: $FILE_DESC
 
 Overall Project Request: $PROJECT_REQ
 
-PREVIOUSLY GENERATED FILES IN THIS PROJECT (Use exact variable names, functions, and relative paths defined here):
+PREVIOUSLY GENERATED FILES IN THIS PROJECT:
 ${ACCUMULATED_CONTEXT:-None yet (this is the first file).}
 
-Rules:
-- Output ONLY valid code for $FILE_PATH.
-- Do NOT wrap in markdown explanation text, state no preamble or postscript.
-- Provide complete code with zero placeholders or comments like '// TODO'.
-- Match exact variable names and paths defined in the PREVIOUSLY GENERATED FILES."
+STRICT Unix/Bash Safety Rules:
+1. Configuration scripts MUST ONLY set/declare environment variables. NEVER write functions in config files that source the config file itself (causes infinite recursion segfault).
+2. Helper scripts (like parsers/utils) must execute once and exit when called. Do NOT place infinite loops (while true) inside helper scripts if a main/launcher script is responsible for looping.
+3. Match exact variable names and paths defined in PREVIOUSLY GENERATED FILES.
+4. Output ONLY valid executable code with zero markdown wrapping, preamble, or postscript."
 
     FILE_CODE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
 $BUILD_PROMPT
 INSIDE_HEREDOC
 )
 
-    # Strip thinking blocks and markdown code block wrappers
     CLEAN_CODE=$(echo "$FILE_CODE" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\n//g; s/```//g')
 
-    # Save directly to the target file
     echo "$CLEAN_CODE" > "$FILE_PATH"
 
-    # Make executable if it's a shell script or python binary
     if [[ "$FILE_PATH" == *.sh ]] || [[ "$FILE_PATH" == bin/* ]] || head -n 1 "$FILE_PATH" | grep -q "^#!"; then
         chmod +x "$FILE_PATH"
     fi
 
-    # Append to accumulated context for the next files in the loop
     ACCUMULATED_CONTEXT="${ACCUMULATED_CONTEXT}
 --- START FILE: $FILE_PATH ---
 $CLEAN_CODE
@@ -122,5 +113,5 @@ $CLEAN_CODE
 done
 
 echo -e "\n==================================================="
-echo " SUCCESS: Project build complete with full context integration!"
+echo " SUCCESS: Project build complete!"
 echo -e "===================================================\n"
