@@ -10,17 +10,18 @@ done
 SCRIPT_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
 
 # Load configuration
-if [ -f "$SCRIPT_DIR/config.env" ]; then
-    source "$SCRIPT_DIR/config.env"
+CONFIG_FILE="$SCRIPT_DIR/config.env"
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
 else
     CHAT_MODEL="qwen2.5-coder:7b"
 fi
 
-VERSION="2.0.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.3.1)"
+VERSION="2.1.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.3.1)"
 
 show_help() {
     cat << 'HELP'
-aicli v2.0.0 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.1.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -29,15 +30,17 @@ SUBCOMMANDS:
     ask, -a       Quick shell assistant & single-prompt Q&A.
     arch, -r      Architect system blueprints & JSON file-tree plans.
     build, -b     Autonomous multi-file developer loop with cumulative context memory.
+    model, -m     View or change the active Ollama local model.
 
 FLAGS:
     -h, --help    Show this help message and exit.
     -v, --version Show version information.
 
 EXAMPLES:
+    aicli model                    Show current active model and available Ollama models.
+    aicli model llama3:8b          Switch active model to llama3:8b.
     aicli ask "How do I check open ports using ss or netstat?"
-    aicli arch "A modular Python Flask REST API with SQLite"
-    aicli build "A 2-file Bash bandwidth monitor in config/net.conf and scripts/netmon.sh"
+    aicli build "A 2-file Bash tool: config/net.conf and scripts/netmon.sh"
 HELP
 }
 
@@ -46,6 +49,38 @@ SUBCOMMAND="$1"
 shift
 
 case "$SUBCOMMAND" in
+    model|-m)
+        NEW_MODEL="$1"
+        if [ -z "$NEW_MODEL" ]; then
+            echo "==================================================="
+            echo " Active Ollama Model: ${CHAT_MODEL:-qwen2.5-coder:7b}"
+            echo "==================================================="
+            echo -e "\nAvailable Local Models (Ollama):"
+            ollama list | awk 'NR>1 {print "  - " $1}'
+            echo -e "\nTo switch models, run:"
+            echo "  aicli model <model_name>"
+            exit 0
+        fi
+
+        # Verify model exists in Ollama
+        if ! ollama list | grep -q "^${NEW_MODEL}:\|^${NEW_MODEL} "; then
+            echo "Warning: Model '$NEW_MODEL' is not currently downloaded in Ollama."
+            read -p "Do you want to pull '$NEW_MODEL' now? (y/N): " choice
+            case "$choice" in
+                y|Y)
+                    ollama pull "$NEW_MODEL"
+                    ;;
+                *)
+                    echo "Aborted model change."
+                    exit 1
+                    ;;
+            esac
+        fi
+
+        echo "CHAT_MODEL=\"$NEW_MODEL\"" > "$CONFIG_FILE"
+        echo "Active model updated to: $NEW_MODEL"
+        ;;
+
     ask|-a)
         PROMPT="$*"
         if [ -z "$PROMPT" ]; then
@@ -76,7 +111,7 @@ Project Request: $PROMPT"
         fi
 
         echo -e "\n==================================================="
-        echo " PHASE 1: Architecting System & File Tree"
+        echo " PHASE 1: Architecting System & File Tree (Model: $CHAT_MODEL)"
         echo -e "===================================================\n"
 
         ARCH_PROMPT="You are a Lead Software Architect.
@@ -111,7 +146,7 @@ INSIDE_HEREDOC
         echo "Architect generated a $FILE_COUNT-file plan."
 
         echo -e "\n==================================================="
-        echo " PHASE 2: Autonomous Code Building Loop (v1.3.1 Rules)"
+        echo " PHASE 2: Autonomous Code Building Loop (Model: $CHAT_MODEL)"
         echo -e "===================================================\n"
 
         ACCUMULATED_CONTEXT=""
