@@ -23,7 +23,7 @@ INDEX_FILE="$IDX_DIR/$TODAY.keywords"
 mkdir -p "$SUM_DIR" "$IDX_DIR"
 touch "$SUMMARY_FILE" "$INDEX_FILE"
 
-# Mode: Search past memory files
+# Mode: Search past memory files manually
 if [ "$1" == "--search" ]; then
     QUERY="$2"
     if [ -z "$QUERY" ]; then
@@ -44,12 +44,34 @@ if [ -z "$USER_PROMPT" ]; then
     exit 1
 fi
 
-# Read context and keep linebreaks intact
+# 1. Read today's context
 DAILY_CONTEXT=$(cat "$SUMMARY_FILE")
 
+# 2. Cross-Day Auto-Retrieval: Search past daily files for matching words (>3 chars)
+RELEVANT_PAST_MEMORIES=""
+for WORD in $USER_PROMPT; do
+    CLEAN_WORD=$(echo "$WORD" | sed -E 's/[^a-zA-Z0-9]//g')
+    # Search words longer than 3 chars, excluding today's file
+    if [ ${#CLEAN_WORD} -gt 3 ]; then
+        MATCHES=$(grep -rn -i "$CLEAN_WORD" "$SUM_DIR/" 2>/dev/null | grep -v "$TODAY.md" | head -n 3)
+        if [ -n "$MATCHES" ]; then
+            RELEVANT_PAST_MEMORIES="${RELEVANT_PAST_MEMORIES}\n${MATCHES}"
+        fi
+    fi
+done
+
+# Clean up duplicate matches across words
+CLEANED_PAST_MEMORIES=$(echo -e "$RELEVANT_PAST_MEMORIES" | sort -u | sed '/^$/d')
+
 SYSTEM_PROMPT="You are a CLI terminal assistant. Always keep answers concise.
-Past context summary for today ($TODAY):
-${DAILY_CONTEXT:-None yet}"
+
+Today's Date: $TODAY
+
+Past Context Summary for Today ($TODAY):
+${DAILY_CONTEXT:-None yet}
+
+Automatically Retrieved Related Past Memories:
+${CLEANED_PAST_MEMORIES:-None found}"
 
 echo -e "\n[AI Thinking...]\n"
 
@@ -74,7 +96,7 @@ AI: $RESPONSE
 SUM_HEREDOC
 )
     
-    # Strip <think> tags AND Ollama's "Thinking... ...done thinking." blocks across multiple lines
+    # Strip <think> tags AND Ollama's "Thinking... ...done thinking." blocks
     CLEAN_SUM=$(echo "$RAW_SUM" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/Thinking\b.*?\.\.\.done thinking\.?//gis' | tr '\n' ' ' | sed 's/  */ /g')
     
     if [ -n "$CLEAN_SUM" ]; then
