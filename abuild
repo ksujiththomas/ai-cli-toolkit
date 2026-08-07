@@ -58,7 +58,7 @@ FILE_COUNT=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(len(json.l
 echo "Architect generated a $FILE_COUNT-file plan."
 
 echo -e "\n==================================================="
-echo " PHASE 2: Autonomous Code Building Loop (with Safety Controls)"
+echo " PHASE 2: Autonomous Code Building Loop (with Hardened Rules)"
 echo -e "===================================================\n"
 
 ACCUMULATED_CONTEXT=""
@@ -84,11 +84,13 @@ Overall Project Request: $PROJECT_REQ
 PREVIOUSLY GENERATED FILES IN THIS PROJECT:
 ${ACCUMULATED_CONTEXT:-None yet (this is the first file).}
 
-STRICT Unix/Bash Safety Rules:
-1. Configuration scripts MUST ONLY set/declare environment variables. NEVER write functions in config files that source the config file itself (causes infinite recursion segfault).
-2. Helper scripts (like parsers/utils) must execute once and exit when called. Do NOT place infinite loops (while true) inside helper scripts if a main/launcher script is responsible for looping.
-3. Match exact variable names and paths defined in PREVIOUSLY GENERATED FILES.
-4. Output ONLY valid executable code with zero markdown wrapping, preamble, or postscript."
+STRICT Code Generation Rules:
+1. CONFIG FILES: Must ONLY declare/export variables. NEVER put functions inside config files that source the config file itself (causes infinite recursion segfault).
+2. HELPER SCRIPTS: Must run single-pass and exit. Do NOT place infinite loops (while true) inside helper scripts if a launcher script handles orchestration.
+3. RELATIVE SOURCING: Helper/launcher scripts MUST dynamically resolve directory path (e.g. SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\") to source config files safely regardless of execution directory.
+4. PARSING SYSTEM DATA: When reading files like /proc, /sys, or logs, use robust AWK regex field separators (e.g., awk -F'[: ]+') instead of rigid fixed-column cut or fragile string matching.
+5. MATCH VARIABLES: Match exact variable names and paths defined in PREVIOUSLY GENERATED FILES.
+6. OUTPUT ONLY valid executable code with zero markdown wrapping, preamble, or postscript."
 
     FILE_CODE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
 $BUILD_PROMPT
