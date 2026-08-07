@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+
+# Resolve actual script directory even when invoked via symlink
+TARGET_FILE="${BASH_SOURCE[0]}"
+while [ -L "$TARGET_FILE" ]; do
+    TARGET_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
+    TARGET_FILE="$(readlink "$TARGET_FILE")"
+    [[ $TARGET_FILE != /* ]] && TARGET_FILE="$TARGET_DIR/$TARGET_FILE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
+
+if [ -f "$SCRIPT_DIR/config.env" ]; then
+    source "$SCRIPT_DIR/config.env"
+else
+    echo "Error: config.env not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+PROJECT_REQ="$*"
+if [ -z "$PROJECT_REQ" ]; then
+    echo "Usage: aarch \"Describe your big project idea or system requirement\""
+    exit 1
+fi
+
+SYSTEM_PROMPT="You are a Principal Software Architect. Your task is NOT to write full implementation code, but to DECOMPOSE a complex project into small, isolated, production-ready modules.
+
+Follow this exact blueprint output format:
+
+## System Architecture Overview
+Briefly describe the design patterns, storage layer, and flow.
+
+## Module Breakdown
+List each module/function with:
+1. Module Name
+2. Input/Output Interfaces
+3. Specific Edge Cases & Safety Constraints
+
+## Implementation Sequence (Step-by-Step Prompts)
+Provide exact 1-sentence prompts that can be fed sequentially to a code-generation model to build each piece independently.
+
+Rules:
+- Never generate monolithic code blocks.
+- Keep components decoupled and simple.
+- Prioritize zero-dependency POSIX/Unix tools where possible."
+
+echo -e "\n[Architecting System Blueprint...]\n"
+
+RESPONSE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
+System: $SYSTEM_PROMPT
+User: $PROJECT_REQ
+INSIDE_HEREDOC
+)
+
+echo -e "$RESPONSE\n"
+
+# Optionally save the blueprint into architectural memory
+ARCH_DIR="$SCRIPT_DIR/memory/blueprints"
+mkdir -p "$ARCH_DIR"
+SLUG=$(echo "$PROJECT_REQ" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-30)
+BLUEPRINT_FILE="$ARCH_DIR/$(date +%Y-%m-%d)_$SLUG.md"
+
+echo "# Architectural Blueprint: $PROJECT_REQ" > "$BLUEPRINT_FILE"
+echo "Date: $(date)" >> "$BLUEPRINT_FILE"
+echo -e "\n$RESPONSE" >> "$BLUEPRINT_FILE"
+
+echo "---------------------------------------------------"
+echo "Saved blueprint to: $BLUEPRINT_FILE"
