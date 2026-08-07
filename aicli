@@ -17,11 +17,11 @@ else
     CHAT_MODEL="qwen2.5-coder:7b"
 fi
 
-VERSION="2.1.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.3.1)"
+VERSION="2.2.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.4.0)"
 
 show_help() {
     cat << 'HELP'
-aicli v2.1.0 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.2.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -112,7 +112,7 @@ Project Request: $PROMPT"
 
         echo -e "\n==================================================="
         echo " PHASE 1: Architecting System & File Tree (Model: $CHAT_MODEL)"
-        echo -e "===================================================\n"
+        echo -e "==================================================-\n"
 
         ARCH_PROMPT="You are a Lead Software Architect.
 Decompose this project into discrete, modular code files.
@@ -179,10 +179,11 @@ Wrap your entire code response inside <FILE_CONTENT> and </FILE_CONTENT> tags.
 Rules:
 1. CONFIG FILES ($FILE_PATH): Output ONLY variable exports. Do NOT write script logic or source statements inside config files.
 2. RELATIVE PATHS: Use SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\" and relative paths (e.g., \$SCRIPT_DIR/../config/env.sh).
-3. SAFE MATH & PARSING:
+3. DIRECTORY INTEGRITY: Whenever writing to a file or database path defined in variables, explicitly ensure the target directory exists using 'mkdir -p \"\$(dirname \"\$TARGET_FILE\")\"' before performing write operations.
+4. SAFE MATH & PARSING:
    - Perform percentage calculations directly inside AWK (e.g. awk '/MemTotal/ {t=\$2} /MemAvailable/ {a=\$2} END {printf \"%.2f\", (t-a)/t*100}' /proc/meminfo).
    - Do NOT pass raw AWK variables into 'bc' without fallback default values.
-4. Do NOT repeat code from other files inside $FILE_PATH."
+5. Do NOT repeat code from other files inside $FILE_PATH."
 
             FILE_CODE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
 $BUILD_PROMPT
@@ -225,4 +226,4 @@ $CLEAN_CODE
         echo "Run 'aicli --help' for usage instructions."
         exit 1
         ;;
-esac
+es:
