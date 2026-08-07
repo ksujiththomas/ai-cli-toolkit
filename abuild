@@ -58,7 +58,7 @@ FILE_COUNT=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(len(json.l
 echo "Architect generated a $FILE_COUNT-file plan."
 
 echo -e "\n==================================================="
-echo " PHASE 2: Autonomous Code Building Loop (with Hardened Rules)"
+echo " PHASE 2: Autonomous Code Building Loop (Hardened Math & Parsing)"
 echo -e "===================================================\n"
 
 ACCUMULATED_CONTEXT=""
@@ -74,7 +74,7 @@ for (( i=0; i<$FILE_COUNT; i++ )); do
 
     mkdir -p "$(dirname "$FILE_PATH")"
 
-    BUILD_PROMPT="You are a Senior Developer. Write the FULL, PRODUCTION-READY implementation for the following file:
+    BUILD_PROMPT="You are a Senior Developer. Write ONLY the implementation for: $FILE_PATH
 
 File Path: $FILE_PATH
 Requirements: $FILE_DESC
@@ -84,20 +84,25 @@ Overall Project Request: $PROJECT_REQ
 PREVIOUSLY GENERATED FILES IN THIS PROJECT:
 ${ACCUMULATED_CONTEXT:-None yet (this is the first file).}
 
-STRICT Code Generation Rules:
-1. CONFIG FILES: Must ONLY declare/export variables. NEVER put functions inside config files that source the config file itself (causes infinite recursion segfault).
-2. HELPER SCRIPTS: Must run single-pass and exit. Do NOT place infinite loops (while true) inside helper scripts if a launcher script handles orchestration.
-3. RELATIVE SOURCING: Helper/launcher scripts MUST dynamically resolve directory path (e.g. SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\") to source config files safely regardless of execution directory.
-4. PARSING SYSTEM DATA: When reading files like /proc, /sys, or logs, use robust AWK regex field separators (e.g., awk -F'[: ]+') instead of rigid fixed-column cut or fragile string matching.
-5. MATCH VARIABLES: Match exact variable names and paths defined in PREVIOUSLY GENERATED FILES.
-6. OUTPUT ONLY valid executable code with zero markdown wrapping, preamble, or postscript."
+CRITICAL INSTRUCTION:
+Write ONLY the code for $FILE_PATH.
+Wrap your entire code response inside <FILE_CONTENT> and </FILE_CONTENT> tags.
+
+Rules:
+1. CONFIG FILES ($FILE_PATH): If this is a config file, output ONLY variable exports. Do NOT write script logic, function calls, or source statements inside config files.
+2. RELATIVE PATHS: If sourcing other files from subdirectories, use SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\" and relative paths (e.g., \$SCRIPT_DIR/../config/env.sh).
+3. SAFE MATH & PARSING:
+   - Perform all percentage calculations directly inside AWK (e.g. awk '/MemTotal/ {t=\$2} /MemAvailable/ {a=\$2} END {printf \"%.2f\", (t-a)/t*100}' /proc/meminfo).
+   - Do NOT pass raw AWK variables into 'bc' without fallback default values.
+4. Do NOT repeat code from other files inside $FILE_PATH."
 
     FILE_CODE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
 $BUILD_PROMPT
 INSIDE_HEREDOC
 )
 
-    CLEAN_CODE=$(echo "$FILE_CODE" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\n//g; s/```//g')
+    CLEAN_CODE=$(echo "$FILE_CODE" | perl -0777 -ne 'if (/<FILE_CONTENT>(.*?)<\/FILE_CONTENT>/s) { print $1; } else { print $_; }')
+    CLEAN_CODE=$(echo "$CLEAN_CODE" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\n//g; s/```//g' | sed '/^[[:space:]]*$/d')
 
     echo "$CLEAN_CODE" > "$FILE_PATH"
 
@@ -106,9 +111,9 @@ INSIDE_HEREDOC
     fi
 
     ACCUMULATED_CONTEXT="${ACCUMULATED_CONTEXT}
---- START FILE: $FILE_PATH ---
+# --- START FILE: $FILE_PATH ---
 $CLEAN_CODE
---- END FILE: $FILE_PATH ---
+# --- END FILE: $FILE_PATH ---
 "
 
     echo "Saved -> $FILE_PATH ($(wc -l < "$FILE_PATH") lines)"
