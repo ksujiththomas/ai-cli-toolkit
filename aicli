@@ -17,11 +17,11 @@ else
     CHAT_MODEL="qwen2.5-coder:7b"
 fi
 
-VERSION="2.2.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.4.0)"
+VERSION="2.3.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.5.0)"
 
 show_help() {
     cat << 'HELP'
-aicli v2.2.0 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.3.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -178,7 +178,9 @@ Wrap your entire code response inside <FILE_CONTENT> and </FILE_CONTENT> tags.
 
 Rules:
 1. CONFIG FILES ($FILE_PATH): Output ONLY variable exports. Do NOT write script logic or source statements inside config files.
-2. RELATIVE PATHS: Use SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\" and relative paths (e.g., \$SCRIPT_DIR/../config/env.sh).
+2. PATH RESOLUTION & SOURCING:
+   - Always initialize SCRIPT_DIR: SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
+   - For files located inside subdirectories like 'bin/', always source other modules relative to the project root using '..', e.g., source \"\$SCRIPT_DIR/../config/settings.conf\" and source \"\$SCRIPT_DIR/../lib/module.sh\". Never assume a flat execution context.
 3. DIRECTORY INTEGRITY: Whenever writing to a file or database path defined in variables, explicitly ensure the target directory exists using 'mkdir -p \"\$(dirname \"\$TARGET_FILE\")\"' before performing write operations.
 4. SAFE MATH & PARSING:
    - Perform percentage calculations directly inside AWK (e.g. awk '/MemTotal/ {t=\$2} /MemAvailable/ {a=\$2} END {printf \"%.2f\", (t-a)/t*100}' /proc/meminfo).
@@ -210,7 +212,7 @@ $CLEAN_CODE
 
         echo -e "\n==================================================="
         echo " SUCCESS: Project build complete!"
-        echo -e "===================================================\n"
+        echo -e "==================================================-\n"
         ;;
 
     -v|--version)
@@ -226,4 +228,4 @@ $CLEAN_CODE
         echo "Run 'aicli --help' for usage instructions."
         exit 1
         ;;
-es:
+esac
