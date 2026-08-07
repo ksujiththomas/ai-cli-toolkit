@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+
+# Resolve actual script directory even when invoked via symlink
+TARGET_FILE="${BASH_SOURCE[0]}"
+while [ -L "$TARGET_FILE" ]; do
+    TARGET_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
+    TARGET_FILE="$(readlink "$TARGET_FILE")"
+    [[ $TARGET_FILE != /* ]] && TARGET_FILE="$TARGET_DIR/$TARGET_FILE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
+
+if [ -f "$SCRIPT_DIR/config.env" ]; then
+    source "$SCRIPT_DIR/config.env"
+else
+    echo "Error: config.env not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+PROJECT_REQ="$*"
+if [ -z "$PROJECT_REQ" ]; then
+    echo "Usage: abuild \"Describe the project you want to auto-build\""
+    exit 1
+fi
+
+echo -e "\n==================================================="
+echo " PHASE 1: Architecting System & File Tree"
+echo -e "===================================================\n"
+
+# Step 1: Architect prompt - output STRICT JSON array of files to create
+ARCH_PROMPT="You are a Lead Software Architect.
+Decompose this project into discrete, modular code files.
+OUTPUT ONLY VALID JSON raw array with no markdown formatting or extra text.
+
+JSON Format:
+[
+  {
+    \"path\": \"relative/file/path.ext\",
+    \"description\": \"Specific purpose of this file and precise implementation requirements.\"
+  }
+]
+
+Project Request: $PROJECT_REQ"
+
+RAW_PLAN=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
+$ARCH_PROMPT
+INSIDE_HEREDOC
+)
+
+# Clean json output from model
+CLEAN_JSON=$(echo "$RAW_PLAN" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```json//g; s/```//g' | tr -d '\r')
+
+# Validate JSON parsing using python3
+if ! echo "$CLEAN_JSON" | python3 -m json.tool >/dev/null 2>&1; then
+    echo "Error: Architect failed to generate valid JSON plan."
+    echo "Raw output was:"
+    echo "$RAW_PLAN"
+    exit 1
+fi
+
+FILE_COUNT=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(len(json.load(sys.stdin)))")
+echo "Architect generated a $FILE_COUNT-file plan."
+
+echo -e "\n==================================================="
+echo " PHASE 2: Autonomous Code Building Loop (with Context)"
+echo -e "===================================================\n"
+
+ACCUMULATED_CONTEXT=""
+
+# Step 2: Loop through every file, pass cumulative context, generate code & save
+for (( i=0; i<$FILE_COUNT; i++ )); do
+    FILE_PATH=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)[$i]['path'])")
+    FILE_DESC=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)[$i]['description'])")
+
+    echo "---------------------------------------------------"
+    echo "Building [$((i+1))/$FILE_COUNT]: $FILE_PATH"
+    echo "Purpose: $FILE_DESC"
+    echo "---------------------------------------------------"
+
+    # Make parent directory if it doesn't exist
+    mkdir -p "$(dirname "$FILE_PATH")"
+
+    BUILD_PROMPT="You are a Senior Developer. Write the FULL, PRODUCTION-READY implementation for the following file:
+
+File Path: $FILE_PATH
+Requirements: $FILE_DESC
+
+Overall Project Request: $PROJECT_REQ
+
+PREVIOUSLY GENERATED FILES IN THIS PROJECT (Use exact variable names, functions, and relative paths defined here):
+${ACCUMULATED_CONTEXT:-None yet (this is the first file).}
+
+Rules:
+- Output ONLY valid code for $FILE_PATH.
+- Do NOT wrap in markdown explanation text, state no preamble or postscript.
+- Provide complete code with zero placeholders or comments like '// TODO'.
+- Match exact variable names and paths defined in the PREVIOUSLY GENERATED FILES."
+
+    FILE_CODE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
+$BUILD_PROMPT
+INSIDE_HEREDOC
+)
+
+    # Strip thinking blocks and markdown code block wrappers
+    CLEAN_CODE=$(echo "$FILE_CODE" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\n//g; s/```//g')
+
+    # Save directly to the target file
+    echo "$CLEAN_CODE" > "$FILE_PATH"
+
+    # Make executable if it's a shell script or python binary
+    if [[ "$FILE_PATH" == *.sh ]] || [[ "$FILE_PATH" == bin/* ]] || head -n 1 "$FILE_PATH" | grep -q "^#!"; then
+        chmod +x "$FILE_PATH"
+    fi
+
+    # Append to accumulated context for the next files in the loop
+    ACCUMULATED_CONTEXT="${ACCUMULATED_CONTEXT}
+--- START FILE: $FILE_PATH ---
+$CLEAN_CODE
+--- END FILE: $FILE_PATH ---
+"
+
+    echo "Saved -> $FILE_PATH ($(wc -l < "$FILE_PATH") lines)"
+done
+
+echo -e "\n==================================================="
+echo " SUCCESS: Project build complete with full context integration!"
+echo -e "===================================================\n"
