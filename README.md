@@ -322,7 +322,9 @@ Commands inside chat: `/quit` (or `/exit`), `/clear` (reset conversation history
 `/help`. Pass an opening message directly: `aagent --chat "what's in this repo?"`.
 Chat uses the builder model and the configured autonomy `--mode`; each turn is capped
 at `CHAT_MAX_STEPS` tool calls (default 15) and the prompt keeps the last
-`CHAT_HISTORY_TURNS` turns (default 10).
+`CHAT_HISTORY_TURNS` turns (default 10). Every session starts with a snapshot of the
+working directory (file listing, 2 levels deep), so the model knows what already
+exists and inspects files itself instead of asking you to describe them.
 
 ### `aicli model`
 
