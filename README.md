@@ -225,12 +225,16 @@ its own work.
 
 It runs in three phases, each of which can use a **different local model**:
 
-1. **Architect** (`ARCHITECT_MODEL`) writes a short step-by-step plan.
+1. **Architect** (`ARCHITECT_MODEL`) writes a short step-by-step plan **plus a
+   machine-readable deliverables list** — every file the task requires.
 2. **Builder** (`BUILDER_MODEL`) works the plan as a tool-calling loop: it emits one tool
    call per turn — `read`, `write`, `ls`, `run`, `done` — and `aicli` executes it and feeds
-   the result back, up to `AGENT_MAX_STEPS` turns.
-3. **Reviewer** (`REVIEWER_MODEL`) reads every file the builder changed, then either approves
-   or sends concrete revision notes back to the builder (up to `AGENT_MAX_REVISIONS` rounds).
+   the result back, up to `AGENT_MAX_STEPS` turns. Every prompt it sees leads with a live
+   `[done]` / `[MISSING]` checklist of the deliverables, so it can't lose track of what
+   still needs creating.
+3. **Reviewer** (`REVIEWER_MODEL`) reads every file the builder changed, checks them
+   against the deliverables list, then either approves or sends file-specific revision
+   notes back to the builder (up to `AGENT_MAX_REVISIONS` rounds).
 
 ```bash
 aagent "Add a --verbose flag to bin/app and test it"
@@ -255,13 +259,32 @@ Safety is layered, not optional: every path is jailed to the directory you run i
 time-limited (`AGENT_CMD_TIMEOUT`), and tool outputs are truncated (`AGENT_MAX_OUTPUT_CHARS`)
 so a runaway `cat` can't blow the model's context window.
 
-Tip: give the roles different models for the classic setup — a larger reasoning model to
-architect and review, a fast coder model to do the writing:
+**How the builder stays on track.** Small local models wander: they rewrite one file
+forever, chatter without calling tools, or declare victory on a skeleton. The harness
+compensates, so you don't have to babysit:
+
+- **Deliverables checklist** — every builder prompt starts with the architect's file list
+  marked `[done]` / `[MISSING]`, so the model always knows what's left.
+- **`done` is gated** — calling `done` while deliverables are still missing is rejected
+  with the missing list; three rejections in a row aborts the run.
+- **Rolling history** — only the last few tool exchanges are kept verbatim
+  (`AGENT_HISTORY_KEPT`, default 6); the checklist carries the state, so long runs
+  don't drown the model in context.
+- **Stuck detectors** — rewriting the same file with identical content three times
+  triggers a redirect to the missing files; ignoring the tool protocol three times in
+  a row aborts with a suggestion to use a larger model.
+- **Forgiving parser** — slightly malformed tool calls (JSON wrapped in prose) are
+  recovered automatically instead of failing the step.
+
+**Model size matters more than anything else here.** A 7B coder model can run the agent
+loop, but it will need the guardrails above to finish real tasks. For noticeably better
+agency, give the architect and reviewer a larger reasoning model and keep a fast coder
+model on builder duty:
 
 ```bash
-aicli config architect-model llama3.1:8b
-aicli config builder-model qwen2.5-coder:7b
-aicli config reviewer-model llama3.1:8b
+aicli config architect-model qwen2.5-coder:32b
+aicli config builder-model qwen2.5-coder:14b
+aicli config reviewer-model qwen2.5-coder:32b
 ```
 
 (Each role falls back to `CHAT_MODEL` when unset, so this is opt-in.)
@@ -307,6 +330,7 @@ for you (one key at a time — other keys are preserved).
 | `AGENT_MAX_OUTPUT_CHARS` | `4000` | Truncate individual tool outputs to this many chars. |
 | `AGENT_CMD_TIMEOUT` | `60` | Seconds before a single agent shell command is killed. |
 | `AGENT_MODEL_TIMEOUT` | `300` | Seconds before a single agent model call is killed. |
+| `AGENT_HISTORY_KEPT` | `6` | How many of the most recent builder tool exchanges are kept verbatim in each prompt (the deliverables checklist carries the rest of the state). |
 
 **Tuning `CONTEXT_WINDOW_FILES`:** higher values give the model more cross-file awareness
 (better imports, consistent config keys) at the cost of longer prompts and slower generation.
@@ -386,6 +410,9 @@ Key implementation details:
 | Builds get confused on large projects | Context window exhausted | Lower the context window: `aicli config context-window 3` |
 | `Error: architect returned an unsafe file path` | Model emitted an absolute/`..` path | Re-run the build; if it persists, try a different model |
 | `AGENT: max steps reached` (without `done`) | Task too big for `AGENT_MAX_STEPS`, or the model is looping | Raise it for the run (`--max-steps 50`) or split the task |
+| `done REJECTED - these deliverables are still missing` (agent) | The builder tried to finish before creating every file on the checklist | Nothing to fix — the gate worked. If it repeats, the task may be too vague; make the deliverables explicit in your request |
+| `AGENT: model ignored the tool protocol 3 times in a row` | Small model replying in prose instead of `<TOOL>` blocks | Use a larger model for the builder role (`aicli config builder-model qwen2.5-coder:14b`) |
+| `AGENT: revision round produced no changes` | The builder couldn't act on the reviewer's notes | Check the notes in the output; simplify the task or use a stronger builder model |
 | `Warning: 'bwrap' not found; ... Falling back to confirm mode` | `bwrap` isn't installed | Install bubblewrap (`apt install bubblewrap`) for unattended sandbox mode, or just use `confirm` |
 | `Error: command denied by safety policy` (agent) | The model tried a denylisted command (`sudo`, `rm -rf /`, …) | Nothing to fix — the guard worked. The agent sees the denial and adapts |
 | `Error: model 'X' is not downloaded` (agent) | A role model isn't pulled | `ollama pull X`, or point the role at a model you have |
