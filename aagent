@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# 'aagent' - shortcut for `aicli agent`: the sandboxed multi-model agent.
+# Resolves the real aicli script next to this file (follows symlinks),
+# so it works whether installed via symlink, copy, or PATH.
+TARGET="${BASH_SOURCE[0]}"
+while [ -L "$TARGET" ]; do
+    DIR="$(cd -P "$(dirname "$TARGET")" && pwd)"
+    TARGET="$(readlink "$TARGET")"
+    [[ "$TARGET" != /* ]] && TARGET="$DIR/$TARGET"
+done
+exec "$(cd -P "$(dirname "$TARGET")" && pwd)/aicli" agent "$@"

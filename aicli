@@ -50,11 +50,28 @@ CHAT_MODEL="qwen2.5-coder:7b"
 # the model's context window isn't blown out by cumulative history.
 CONTEXT_WINDOW_FILES=5
 
+# --- Agent mode defaults (overridable via config.env / `aicli config`) ---
+# Autonomy: sandbox (bwrap jail, no prompts), confirm (ask before each shell
+# command), or dry-run (print tool calls, execute nothing).
+AGENT_MODE="sandbox"
+AGENT_MAX_STEPS=25          # max tool-call turns per agent run (all phases)
+AGENT_MAX_REVISIONS=2       # reviewer -> builder fix rounds
+AGENT_MAX_OUTPUT_CHARS=4000 # truncate individual tool outputs to this
+AGENT_CMD_TIMEOUT=60        # seconds: per shell command run by the agent
+AGENT_MODEL_TIMEOUT=300     # seconds: per model call timeout
+
 if [ -f "$CONFIG_FILE" ]; then
     # config.env only ever holds simple KEY="value" assignments written by us.
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
 fi
+
+# Role models for agent mode: which model architects, builds, and reviews.
+# Each falls back to CHAT_MODEL when unset, so changing the main model
+# automatically moves all three roles unless overridden individually.
+: "${ARCHITECT_MODEL:=$CHAT_MODEL}"
+: "${BUILDER_MODEL:=$CHAT_MODEL}"
+: "${REVIEWER_MODEL:=$CHAT_MODEL}"
 
 # Persist one config key without clobbering the others.
 save_config() {
@@ -67,7 +84,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.3.1 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0)"
+VERSION="2.4.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.0.0)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -78,11 +95,12 @@ case "$(basename "$0")" in
     ai)     set -- ask "$@" ;;
     aarch)  set -- arch "$@" ;;
     abuild) set -- build "$@" ;;
+    aagent) set -- agent "$@" ;;
 esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.3.1 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.4.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -92,6 +110,8 @@ SUBCOMMANDS:
     arch, -r      Architect system blueprints & JSON file-tree plans.   (alias: aarch)
     build, -b     Autonomous multi-file developer loop with cumulative
                   context memory.                                       (alias: abuild)
+    agent         Sandboxed multi-model agent: architect plans, builder acts
+                  with filesystem tools, reviewer critiques.            (alias: aagent)
     model, -m     View or change the active Ollama local model.
     config, -c    View or change aicli settings.
 
@@ -107,6 +127,7 @@ EXAMPLES:
     ai "How do I check open ports with ss?"
     aarch "Design a modular Python web scraper with a config parser and DB logger."
     abuild "A 2-file Bash tool: config/net.conf and scripts/netmon.sh"
+    aagent --mode confirm "Add a --verbose flag to bin/app and test it"
 HELP
 }
 
@@ -139,6 +160,368 @@ sanitize_relpath() {
 # Strip <think> blocks and markdown fences from model output.
 strip_model_noise() {
     perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\s*\n?//g; s/```//g' | tr -d '\r'
+}
+
+# ---------------------------------------------------------------------------
+# Agent mode: multi-model sandboxed autonomous loop.
+#
+# Three roles, each runnable on a different local model:
+#   architect -> writes a step plan
+#   builder   -> ReAct loop with filesystem tools (read/write/ls/run/done)
+#   reviewer  -> critiques changed files; sends the builder back for fixes
+#
+# Safety: every path is jailed to the project dir (sanitize_relpath), shell
+# commands are denied by policy list and then run sandboxed (bwrap), confirmed
+# interactively, or not at all (dry-run) depending on AGENT_MODE.
+# ---------------------------------------------------------------------------
+
+# Extract the first <TOOL>...</TOOL> block from stdin.
+extract_tool_json() {
+    perl -0777 -ne 'if (/<TOOL>(.*?)<\/TOOL>/s) { print $1; }'
+}
+
+# Extract the first <VERDICT>...</VERDICT> block from stdin.
+extract_verdict_json() {
+    perl -0777 -ne 'if (/<VERDICT>(.*?)<\/VERDICT>/s) { print $1; }'
+}
+
+# Parse a tool-call JSON doc from stdin.
+# Prints three NUL-separated fields: tool name, first arg, second arg.
+parse_tool_call() {
+    python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.stdout.write("!parse-error\x00\x00")
+    sys.exit(0)
+tool = str(d.get("tool", ""))
+a1 = a2 = ""
+if tool in ("read", "ls"):
+    a1 = str(d.get("path", ""))
+elif tool == "write":
+    a1 = str(d.get("path", ""))
+    a2 = str(d.get("content", ""))
+elif tool == "run":
+    a1 = str(d.get("command", ""))
+elif tool == "done":
+    a1 = str(d.get("summary", ""))
+sys.stdout.write("\x00".join([tool, a1, a2]))
+'
+}
+
+# Parse a reviewer verdict JSON doc from stdin -> "verdict\0notes".
+parse_verdict() {
+    python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.stdout.write("!parse-error\x00")
+    sys.exit(0)
+sys.stdout.write(str(d.get("verdict", "")) + "\x00" + str(d.get("notes", "")))
+'
+}
+
+# Safety policy for the `run` tool: never allow these, even sandboxed.
+agent_cmd_denied() {
+    local lc
+    lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$lc" in
+        *sudo*|*su\ -*|*su\ root*|*mkfs*|*"dd "*|*fdisk*|*shutdown*|*reboot*|*poweroff*|*halt*|*":(){"*|*rm\ -rf\ /*|*rm\ -rf\ ~*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Run a command inside a bubblewrap jail: project dir read-write, the base
+# system read-only, no network, no home directory, nothing else visible.
+agent_run_sandboxed() {
+    local cmd="$1" proj="$2"
+    local -a binds=()
+    local d
+    for d in /usr /bin /sbin /lib /lib64 /etc; do
+        [ -e "$d" ] && binds+=(--ro-bind "$d" "$d")
+    done
+    printf '%s' "$cmd" | timeout "${AGENT_CMD_TIMEOUT:-60}" bwrap \
+        --unshare-net --die-with-parent \
+        "${binds[@]}" \
+        --bind "$proj" "$proj" \
+        --tmpfs /tmp --proc /proc --dev /dev \
+        --chdir "$proj" \
+        --setenv PATH /usr/local/bin:/usr/bin:/bin \
+        --setenv HOME /tmp \
+        bash -s 2>&1
+}
+
+# Run a command only after the user approves it interactively.
+agent_run_confirmed() {
+    local cmd="$1" ans=""
+    echo "Agent wants to run:"
+    echo "  $cmd"
+    read -r -p "Allow this command? (y/N): " ans || ans=""
+    case "$ans" in
+        y|Y) timeout "${AGENT_CMD_TIMEOUT:-60}" bash -c "$cmd" 2>&1 ;;
+        *)   echo "[denied by user]" ;;
+    esac
+}
+
+# aicli agent [--flags] "task description"
+cmd_agent() {
+    local ARCH_M="$ARCHITECT_MODEL" BUILD_M="$BUILDER_MODEL" REV_M="$REVIEWER_MODEL"
+    local MODE="$AGENT_MODE" MAX_STEPS="$AGENT_MAX_STEPS" MAX_REV="$AGENT_MAX_REVISIONS"
+    local OUT_CHARS="$AGENT_MAX_OUTPUT_CHARS" MODEL_TIMEOUT="$AGENT_MODEL_TIMEOUT"
+    local DO_REVIEW=1
+    local NL=$'\n'
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --architect-model)
+                [ $# -ge 2 ] || { echo "Flag --architect-model needs a value." >&2; return 1; }
+                ARCH_M="$2"; shift 2 ;;
+            --builder-model)
+                [ $# -ge 2 ] || { echo "Flag --builder-model needs a value." >&2; return 1; }
+                BUILD_M="$2"; shift 2 ;;
+            --reviewer-model)
+                [ $# -ge 2 ] || { echo "Flag --reviewer-model needs a value." >&2; return 1; }
+                REV_M="$2"; shift 2 ;;
+            --mode)
+                [ $# -ge 2 ] || { echo "Flag --mode needs a value." >&2; return 1; }
+                MODE="$2"; shift 2 ;;
+            --max-steps)
+                [ $# -ge 2 ] || { echo "Flag --max-steps needs a value." >&2; return 1; }
+                MAX_STEPS="$2"; shift 2 ;;
+            --max-revisions)
+                [ $# -ge 2 ] || { echo "Flag --max-revisions needs a value." >&2; return 1; }
+                MAX_REV="$2"; shift 2 ;;
+            --no-review) DO_REVIEW=0; shift ;;
+            --) shift; break ;;
+            -*) echo "Unknown agent flag: $1" >&2; return 1 ;;
+            *) break ;;
+        esac
+    done
+
+    local TASK="$*"
+    if [ -z "$TASK" ]; then
+        echo "Usage: aicli agent [flags] \"task description\"" >&2
+        echo "Flags: --architect-model M --builder-model M --reviewer-model M" >&2
+        echo "       --mode sandbox|confirm|dry-run" >&2
+        echo "       --max-steps N --max-revisions N --no-review" >&2
+        return 1
+    fi
+
+    case "$MODE" in
+        sandbox|confirm|dry-run) ;;
+        *) echo "Error: --mode must be sandbox, confirm, or dry-run." >&2; return 1 ;;
+    esac
+    [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "Error: --max-steps must be a positive integer." >&2; return 1; }
+    [[ "$MAX_REV" =~ ^[0-9]+$ ]] || { echo "Error: --max-revisions must be a non-negative integer." >&2; return 1; }
+
+    local m
+    for m in "$ARCH_M" "$BUILD_M"; do
+        if ! ollama list | awk 'NR>1 {print $1}' | grep -qxF -- "$m"; then
+            echo "Error: model '$m' is not downloaded. Pull it first: ollama pull $m" >&2
+            return 1
+        fi
+    done
+    if [ "$DO_REVIEW" -eq 1 ] && ! ollama list | awk 'NR>1 {print $1}' | grep -qxF -- "$REV_M"; then
+        echo "Error: reviewer model '$REV_M' is not downloaded. Pull it first, or pass --no-review." >&2
+        return 1
+    fi
+
+    if [ "$MODE" = "sandbox" ] && ! command -v bwrap >/dev/null 2>&1; then
+        echo "Warning: 'bwrap' not found; sandbox mode unavailable. Falling back to confirm mode." >&2
+        MODE="confirm"
+    fi
+
+    # The agent's whole world: everything it reads/writes happens under here.
+    local PROJ="$PWD"
+
+    # ---- Phase 1: architect plans ----
+    echo "AGENT phase 1/3: architect ($ARCH_M) planning..."
+    local PLAN
+    PLAN="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "[ROLE:ARCHITECT]
+You are a software architect. Write a short numbered plan (5-10 concrete steps) to accomplish the task below inside the project directory. Output ONLY the plan, no preamble.
+
+Task: $TASK")" || PLAN=""
+    if [ -z "$PLAN" ]; then
+        echo "Error: architect produced no plan." >&2
+        return 1
+    fi
+    echo "$PLAN"
+    echo
+
+    # ---- Phases 2+3: builder loop, with reviewer passes ----
+    local SYS
+    SYS="$(cat <<'SYS_EOF'
+[ROLE:BUILDER]
+You are an autonomous coding agent. Your working directory IS the project root.
+
+TOOLS - respond with EXACTLY ONE tool call per message and NOTHING else:
+<TOOL>{"tool": "read", "path": "relative/path"}</TOOL>
+<TOOL>{"tool": "write", "path": "relative/path", "content": "entire file content"}</TOOL>
+<TOOL>{"tool": "ls", "path": "relative/dir"}</TOOL>
+<TOOL>{"tool": "run", "command": "shell command"}</TOOL>
+<TOOL>{"tool": "done", "summary": "what you accomplished"}</TOOL>
+
+RULES:
+- All paths are relative to the project root. NEVER absolute paths, NEVER "..".
+- The content field must be a valid JSON string (escape newlines as \n and quotes as \").
+- Work step by step: inspect with read/ls, write files, verify with run.
+- Shell commands run restricted and non-interactively; keep them simple.
+- When the task is fully complete, call done.
+SYS_EOF
+)"
+    SYS="${SYS}${NL}${NL}Architect's plan:${NL}${PLAN}${NL}${NL}Task: ${TASK}"
+
+    local -a CHANGED=()
+    local HISTORY="" FULL_PROMPT="$SYS"
+    local step=0 rev=0 finished=0
+
+    echo "AGENT phase 2/3: builder ($BUILD_M) working (mode=$MODE, max_steps=$MAX_STEPS)..."
+
+    while [ "$finished" -eq 0 ]; do
+        local done_flag=0
+        while [ "$step" -lt "$MAX_STEPS" ] && [ "$done_flag" -eq 0 ]; do
+            step=$((step + 1))
+            echo "--- step $step/$MAX_STEPS ---"
+            local response tool_json tool="(none)" tool_result=""
+            response="$(timeout "$MODEL_TIMEOUT" ollama run "$BUILD_M" <<< "$FULL_PROMPT")" || response=""
+
+            tool_json=""
+            if [ -n "$response" ]; then
+                tool_json="$(printf '%s' "$response" | extract_tool_json)"
+            fi
+
+            if [ -z "$tool_json" ]; then
+                tool_result="ERROR: no <TOOL> block found. Reply with exactly one <TOOL>...</TOOL> block and nothing else."
+            else
+                local -a F=()
+                mapfile -d '' -t F < <(printf '%s' "$tool_json" | parse_tool_call)
+                tool="${F[0]:-}"
+                local a1="${F[1]:-}" a2="${F[2]:-}"
+                local sp="" out="" rc=0
+                printf '  > %s %s\n' "$tool" "$(printf '%s' "$a1" | head -c 80)"
+                case "$tool" in
+                    '!parse-error')
+                        tool_result="ERROR: tool call is not valid JSON. Fix the syntax and retry." ;;
+                    read)
+                        if sp="$(sanitize_relpath "$a1")"; then
+                            if [ -f "$PROJ/$sp" ]; then
+                                tool_result="$(cat "$PROJ/$sp")"
+                            else
+                                tool_result="ERROR: file not found: $sp"
+                            fi
+                        else
+                            tool_result="ERROR: path rejected (must be relative, no ..): $a1"
+                        fi ;;
+                    ls)
+                        if [ "$a1" = "." ] || [ "$a1" = "./" ] || [ -z "$a1" ]; then
+                            sp="."
+                        else
+                            sp="$(sanitize_relpath "$a1")" || sp=""
+                        fi
+                        if [ -n "$sp" ] && [ -d "$PROJ/$sp" ]; then
+                            tool_result="$(ls -la "$PROJ/$sp")"
+                        else
+                            tool_result="ERROR: not a directory or path rejected: $a1"
+                        fi ;;
+                    write)
+                        if [ "$MODE" = "dry-run" ]; then
+                            tool_result="dry-run: would write ${#a2} chars to: $a1 (not executed)"
+                        elif sp="$(sanitize_relpath "$a1")"; then
+                            mkdir -p "$PROJ/$(dirname "$sp")"
+                            printf '%s\n' "$a2" > "$PROJ/$sp"
+                            CHANGED+=("$sp")
+                            tool_result="wrote $sp"
+                        else
+                            tool_result="ERROR: path rejected (must be relative, no ..): $a1"
+                        fi ;;
+                    run)
+                        if agent_cmd_denied "$a1"; then
+                            tool_result="ERROR: command denied by safety policy."
+                        elif [ "$MODE" = "dry-run" ]; then
+                            tool_result="dry-run: would run: $a1 (not executed)"
+                        elif [ "$MODE" = "sandbox" ]; then
+                            out="$(agent_run_sandboxed "$a1" "$PROJ")"; rc=$?
+                            tool_result="[exit $rc]${NL}$out"
+                        else
+                            out="$(agent_run_confirmed "$a1")"; rc=$?
+                            tool_result="[exit $rc]${NL}$out"
+                        fi ;;
+                    done)
+                        echo "AGENT: builder finished: $a1"
+                        done_flag=1
+                        break ;;
+                    *)
+                        tool_result="ERROR: unknown tool '$tool'. Available: read, write, ls, run, done." ;;
+                esac
+                # Cap giant outputs so history can't blow the context window.
+                tool_result="$(printf '%s' "$tool_result" | head -c "$OUT_CHARS")"
+                printf '  < %s\n' "$(printf '%s' "$tool_result" | head -n 1 | head -c 160)"
+            fi
+
+            HISTORY="${HISTORY}${NL}Assistant tool call: $tool${NL}Result:${NL}${tool_result}${NL}"
+            FULL_PROMPT="${SYS}${NL}${HISTORY}${NL}Reply with exactly one <TOOL> block."
+        done
+
+        if [ "$step" -ge "$MAX_STEPS" ] && [ "$done_flag" -eq 0 ]; then
+            echo "AGENT: max steps reached."
+        fi
+
+        # ---- Phase 3: reviewer ----
+        if [ "$DO_REVIEW" -eq 0 ] || [ "${#CHANGED[@]}" -eq 0 ]; then
+            finished=1
+            break
+        fi
+        if [ "$rev" -ge "$MAX_REV" ]; then
+            echo "AGENT: max revisions reached; accepting current state."
+            finished=1
+            break
+        fi
+        rev=$((rev + 1))
+        echo "AGENT phase 3/3: reviewer ($REV_M) pass $rev/$MAX_REV..."
+
+        local REV_PROMPT="[ROLE:REVIEWER]
+You are a senior code reviewer. Review the files below against the task. Look for bugs, missing requirements, and inconsistencies.
+Respond with EXACTLY one verdict block and nothing else:
+<VERDICT>{\"verdict\": \"approve\"}</VERDICT>
+or
+<VERDICT>{\"verdict\": \"revise\", \"notes\": \"concrete problems to fix\"}</VERDICT>
+
+Task: $TASK"
+        local f
+        for f in "${CHANGED[@]}"; do
+            REV_PROMPT="${REV_PROMPT}${NL}--- file: $f ---${NL}$(head -c "$OUT_CHARS" "$PROJ/$f")"
+        done
+
+        local vresp vjson verdict="approve" notes=""
+        vresp="$(timeout "$MODEL_TIMEOUT" ollama run "$REV_M" <<< "$REV_PROMPT")" || vresp=""
+        vjson="$(printf '%s' "$vresp" | extract_verdict_json)"
+        if [ -n "$vjson" ]; then
+            local -a V=()
+            mapfile -d '' -t V < <(printf '%s' "$vjson" | parse_verdict)
+            verdict="${V[0]:-approve}"
+            notes="${V[1]:-}"
+        else
+            echo "AGENT: reviewer gave no verdict block; accepting with warning."
+        fi
+
+        if [ "$verdict" = "approve" ]; then
+            echo "AGENT: reviewer approved."
+            finished=1
+        elif [ "$verdict" = "revise" ]; then
+            echo "AGENT: reviewer requested revisions; builder continues."
+            HISTORY="${HISTORY}${NL}Reviewer feedback (pass $rev):${NL}${notes}${NL}Address every point above, then call done again.${NL}"
+            FULL_PROMPT="${SYS}${NL}${HISTORY}${NL}Reply with exactly one <TOOL> block."
+        else
+            echo "AGENT: unclear reviewer verdict ('$verdict'); accepting."
+            finished=1
+        fi
+    done
+
+    echo
+    echo "AGENT: run complete ($step steps, ${#CHANGED[@]} files changed)."
 }
 
 # ---------------------------------------------------------------------------
@@ -188,6 +571,15 @@ case "$SUBCOMMAND" in
             echo "Current aicli settings ($CONFIG_FILE):"
             echo "  CHAT_MODEL=\"$CHAT_MODEL\""
             echo "  CONTEXT_WINDOW_FILES=\"$CONTEXT_WINDOW_FILES\""
+            echo "  ARCHITECT_MODEL=\"$ARCHITECT_MODEL\""
+            echo "  BUILDER_MODEL=\"$BUILDER_MODEL\""
+            echo "  REVIEWER_MODEL=\"$REVIEWER_MODEL\""
+            echo "  AGENT_MODE=\"$AGENT_MODE\""
+            echo "  AGENT_MAX_STEPS=\"$AGENT_MAX_STEPS\""
+            echo "  AGENT_MAX_REVISIONS=\"$AGENT_MAX_REVISIONS\""
+            echo "  AGENT_MAX_OUTPUT_CHARS=\"$AGENT_MAX_OUTPUT_CHARS\""
+            echo "  AGENT_CMD_TIMEOUT=\"$AGENT_CMD_TIMEOUT\""
+            echo "  AGENT_MODEL_TIMEOUT=\"$AGENT_MODEL_TIMEOUT\""
             echo
             echo "Change one with: aicli config <key> <value>"
             exit 0
@@ -203,8 +595,47 @@ case "$SUBCOMMAND" in
                 save_config "CONTEXT_WINDOW_FILES" "$VALUE"
                 echo "CONTEXT_WINDOW_FILES updated to: $VALUE"
                 ;;
+            ARCHITECT_MODEL|architect-model)
+                [ -z "$VALUE" ] && { echo "Usage: aicli config architect-model <model_name>" >&2; exit 1; }
+                save_config "ARCHITECT_MODEL" "$VALUE"
+                echo "ARCHITECT_MODEL updated to: $VALUE"
+                ;;
+            BUILDER_MODEL|builder-model)
+                [ -z "$VALUE" ] && { echo "Usage: aicli config builder-model <model_name>" >&2; exit 1; }
+                save_config "BUILDER_MODEL" "$VALUE"
+                echo "BUILDER_MODEL updated to: $VALUE"
+                ;;
+            REVIEWER_MODEL|reviewer-model)
+                [ -z "$VALUE" ] && { echo "Usage: aicli config reviewer-model <model_name>" >&2; exit 1; }
+                save_config "REVIEWER_MODEL" "$VALUE"
+                echo "REVIEWER_MODEL updated to: $VALUE"
+                ;;
+            AGENT_MODE|agent-mode)
+                case "$VALUE" in
+                    sandbox|confirm|dry-run) ;;
+                    *) echo "Usage: aicli config agent-mode <sandbox|confirm|dry-run>" >&2; exit 1 ;;
+                esac
+                save_config "AGENT_MODE" "$VALUE"
+                echo "AGENT_MODE updated to: $VALUE"
+                ;;
+            AGENT_MAX_STEPS|max-steps|AGENT_MAX_REVISIONS|max-revisions|AGENT_MAX_OUTPUT_CHARS|max-output-chars|AGENT_CMD_TIMEOUT|cmd-timeout|AGENT_MODEL_TIMEOUT|model-timeout)
+                [[ "$VALUE" =~ ^[1-9][0-9]*$ ]] || { echo "Usage: aicli config $KEY <positive integer>" >&2; exit 1; }
+                # Normalize the dashed alias to the canonical KEY name.
+                case "$KEY" in
+                    max-steps) KEY="AGENT_MAX_STEPS" ;;
+                    max-revisions) KEY="AGENT_MAX_REVISIONS" ;;
+                    max-output-chars) KEY="AGENT_MAX_OUTPUT_CHARS" ;;
+                    cmd-timeout) KEY="AGENT_CMD_TIMEOUT" ;;
+                    model-timeout) KEY="AGENT_MODEL_TIMEOUT" ;;
+                esac
+                save_config "$KEY" "$VALUE"
+                echo "$KEY updated to: $VALUE"
+                ;;
             *)
-                echo "Error: unknown setting '$KEY'. Known settings: CHAT_MODEL, CONTEXT_WINDOW_FILES" >&2
+                echo "Error: unknown setting '$KEY'. Known settings:" >&2
+                echo "  CHAT_MODEL, CONTEXT_WINDOW_FILES, ARCHITECT_MODEL, BUILDER_MODEL," >&2
+                echo "  REVIEWER_MODEL, AGENT_MODE, AGENT_MAX_STEPS, AGENT_MAX_REVISIONS," >&2
+                echo "  AGENT_MAX_OUTPUT_CHARS, AGENT_CMD_TIMEOUT, AGENT_MODEL_TIMEOUT" >&2
                 exit 1
                 ;;
         esac
@@ -395,6 +826,10 @@ Rules:
         echo -e "\n==================================================="
         echo " SUCCESS: Project build complete!"
         echo -e "===================================================\n"
+        ;;
+
+    agent)
+        cmd_agent "$@"
         ;;
 
     -v|--version)

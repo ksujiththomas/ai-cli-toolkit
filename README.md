@@ -23,6 +23,7 @@ abuild "A counter CLI tool with config settings, a core logic library, and a mai
   - [`aicli ask` (alias `ai`)](#aicli-ask-alias-ai)
   - [`aicli arch` (alias `aarch`)](#aicli-arch-alias-aarch)
   - [`aicli build` (alias `abuild`)](#aicli-build-alias-abuild)
+  - [`aicli agent` (alias `aagent`)](#aicli-agent-alias-aagent)
   - [`aicli model`](#aicli-model)
   - [`aicli config`](#aicli-config)
 - [Configuration](#configuration)
@@ -38,8 +39,8 @@ abuild "A counter CLI tool with config settings, a core logic library, and a mai
 
 ## How it works
 
-`aicli` is a single Bash script (`aicli`) that shells out to your local Ollama daemon. The three
-shortcuts — `ai`, `aarch`, `abuild` — are either symlinks to that script or tiny wrappers next to
+`aicli` is a single Bash script (`aicli`) that shells out to your local Ollama daemon. The four
+shortcuts — `ai`, `aarch`, `abuild`, `aagent` — are either symlinks to that script or tiny wrappers next to
 it; either way they end up running the same code.
 
 | Command | What it does |
@@ -47,6 +48,7 @@ it; either way they end up running the same code.
 | `aicli ask` / `ai` | Sends one prompt to the model and prints the answer. Your terminal Q&A. |
 | `aicli arch` / `aarch` | Asks the model to act as a software architect: blueprint + JSON file tree for a project idea. |
 | `aicli build` / `abuild` | Two-phase autonomous builder: first the model plans the project as a JSON file list, then `aicli` loops over that list, generating each file with the previously generated files fed back in as context. |
+| `aicli agent` / `aagent` | Sandboxed multi-model agent: an architect model plans, a builder model works the filesystem with tools (`read`/`write`/`ls`/`run`/`done`), and a reviewer model critiques the result and sends it back for fixes. |
 | `aicli model` | Lists downloaded Ollama models, shows the active one, switches it (pulling it first if needed). |
 | `aicli config` | Shows/changes settings like the active model and the build context window. |
 
@@ -77,7 +79,7 @@ Then pick **one** of these two methods:
 
 ### Method A — symlinks (recommended)
 
-Point all four commands at the one script:
+Point all five commands at the one script:
 
 ```bash
 mkdir -p ~/.local/bin
@@ -85,6 +87,7 @@ ln -sf ~/aicli/aicli ~/.local/bin/aicli
 ln -sf ~/aicli/aicli ~/.local/bin/ai
 ln -sf ~/aicli/aicli ~/.local/bin/aarch
 ln -sf ~/aicli/aicli ~/.local/bin/abuild
+ln -sf ~/aicli/aicli ~/.local/bin/aagent
 ```
 
 Make sure `~/.local/bin` is on your `PATH` (add this to `~/.bashrc` or `~/.zshrc` if it isn't):
@@ -94,7 +97,8 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 This works because `aicli` detects the name it was invoked as: running it via the `ai`
-symlink is equivalent to `aicli ask`, `aarch` to `aicli arch`, and `abuild` to `aicli build`.
+symlink is equivalent to `aicli ask`, `aarch` to `aicli arch`, `abuild` to `aicli build`,
+and `aagent` to `aicli agent`.
 
 ### Method B — repo directory on PATH
 
@@ -102,7 +106,7 @@ symlink is equivalent to `aicli ask`, `aarch` to `aicli arch`, and `abuild` to `
 export PATH="$HOME/aicli:$PATH"
 ```
 
-Here the `ai` / `aarch` / `abuild` wrapper scripts in the repo do the dispatching —
+Here the `ai` / `aarch` / `abuild` / `aagent` wrapper scripts in the repo do the dispatching —
 each one finds the real `aicli` script sitting next to it (symlink-safe) and calls it
 with the right subcommand. Use this if you'd rather not create symlinks.
 
@@ -213,6 +217,55 @@ Saved -> config/settings.conf (8 lines)
 **Always review generated code before running it** — especially anything with `sudo`, `rm`,
 or network calls. The model is a fast drafter, not a reviewer.
 
+### `aicli agent` (alias `aagent`)
+
+A sandboxed, multi-model autonomous agent for tasks that need the model to *do things* —
+not just generate text, but read, write, and run code in your project directory, then verify
+its own work.
+
+It runs in three phases, each of which can use a **different local model**:
+
+1. **Architect** (`ARCHITECT_MODEL`) writes a short step-by-step plan.
+2. **Builder** (`BUILDER_MODEL`) works the plan as a tool-calling loop: it emits one tool
+   call per turn — `read`, `write`, `ls`, `run`, `done` — and `aicli` executes it and feeds
+   the result back, up to `AGENT_MAX_STEPS` turns.
+3. **Reviewer** (`REVIEWER_MODEL`) reads every file the builder changed, then either approves
+   or sends concrete revision notes back to the builder (up to `AGENT_MAX_REVISIONS` rounds).
+
+```bash
+aagent "Add a --verbose flag to bin/app and test it"
+
+# Per-run overrides:
+aagent --mode confirm "Refactor config parsing into config/lib.sh"
+aagent --architect-model llama3.1:8b --builder-model qwen2.5-coder:7b \
+       --reviewer-model llama3.1:8b --no-review "Write a Makefile with test and clean targets"
+```
+
+**Autonomy modes** (`--mode`, or `aicli config agent-mode <mode>`):
+
+| Mode | What happens when the agent wants to run a shell command |
+|---|---|
+| `sandbox` (default) | Runs inside a [bubblewrap](https://github.com/containers/bubblewrap) jail: the project dir is read-write, the rest of the system is read-only, no network, no home directory. If `bwrap` isn't installed, falls back to `confirm` with a warning. |
+| `confirm` | Prints the command and asks `Allow this command? (y/N)` every time. |
+| `dry-run` | Prints every tool call but executes nothing — a safe rehearsal. |
+
+Safety is layered, not optional: every path is jailed to the directory you run in
+(absolute paths and `..` are rejected), destructive/privileged commands (`sudo`, `mkfs`,
+`dd`, `rm -rf /`, …) are denied by policy even inside the sandbox, each command is
+time-limited (`AGENT_CMD_TIMEOUT`), and tool outputs are truncated (`AGENT_MAX_OUTPUT_CHARS`)
+so a runaway `cat` can't blow the model's context window.
+
+Tip: give the roles different models for the classic setup — a larger reasoning model to
+architect and review, a fast coder model to do the writing:
+
+```bash
+aicli config architect-model llama3.1:8b
+aicli config builder-model qwen2.5-coder:7b
+aicli config reviewer-model llama3.1:8b
+```
+
+(Each role falls back to `CHAT_MODEL` when unset, so this is opt-in.)
+
 ### `aicli model`
 
 Manage the Ollama model `aicli` talks to. The choice is saved in `config.env`, so it
@@ -245,6 +298,15 @@ for you (one key at a time — other keys are preserved).
 |---|---|---|
 | `CHAT_MODEL` | `qwen2.5-coder:7b` | Ollama model used by every subcommand. |
 | `CONTEXT_WINDOW_FILES` | `5` | In `build` mode, how many of the most recently generated files are fed back as context for the next file. |
+| `ARCHITECT_MODEL` | _(follows `CHAT_MODEL`)_ | Model that plans in `agent` mode. |
+| `BUILDER_MODEL` | _(follows `CHAT_MODEL`)_ | Model that runs the tool loop in `agent` mode. |
+| `REVIEWER_MODEL` | _(follows `CHAT_MODEL`)_ | Model that critiques in `agent` mode. |
+| `AGENT_MODE` | `sandbox` | Agent autonomy: `sandbox` (bwrap jail), `confirm` (ask per command), `dry-run` (execute nothing). |
+| `AGENT_MAX_STEPS` | `25` | Max tool-call turns per agent run, across all phases. |
+| `AGENT_MAX_REVISIONS` | `2` | Reviewer → builder fix rounds per run. |
+| `AGENT_MAX_OUTPUT_CHARS` | `4000` | Truncate individual tool outputs to this many chars. |
+| `AGENT_CMD_TIMEOUT` | `60` | Seconds before a single agent shell command is killed. |
+| `AGENT_MODEL_TIMEOUT` | `300` | Seconds before a single agent model call is killed. |
 
 **Tuning `CONTEXT_WINDOW_FILES`:** higher values give the model more cross-file awareness
 (better imports, consistent config keys) at the cost of longer prompts and slower generation.
@@ -297,6 +359,14 @@ Key implementation details:
 - `build` writes files to disk based on model output. Paths are strictly validated:
   absolute paths and any `.`/`..`/empty path segment abort the build. The tool only
   ever writes inside the directory you run it from.
+- `agent` goes further because it can also *run* commands. Defenses, in order:
+  1. every `read`/`write`/`ls` path is jailed to the project directory;
+  2. a denylist rejects `sudo`, `su`, `mkfs`, `dd`, `rm -rf /`, fork bombs, etc. —
+     these never execute, in any mode;
+  3. in `sandbox` mode commands run under `bwrap` with the project dir read-write,
+     the system read-only, and no network or home directory visible;
+  4. in `confirm` mode every command needs your explicit `y`;
+  5. every command is killed after `AGENT_CMD_TIMEOUT` seconds.
 - Model output is never `eval`'d or executed by `aicli` itself — but the files it
   *writes* are code, so review them before running, same as any generated code.
 - Everything runs locally through Ollama. Your prompts never leave the machine
@@ -315,6 +385,10 @@ Key implementation details:
 | `Architect failed to generate a valid JSON plan after 3 attempts` | Small/weaker model struggling with the JSON-only instruction | Switch to a stronger model (`aicli model qwen2.5-coder:32b`) or simplify the request |
 | Builds get confused on large projects | Context window exhausted | Lower the context window: `aicli config context-window 3` |
 | `Error: architect returned an unsafe file path` | Model emitted an absolute/`..` path | Re-run the build; if it persists, try a different model |
+| `AGENT: max steps reached` (without `done`) | Task too big for `AGENT_MAX_STEPS`, or the model is looping | Raise it for the run (`--max-steps 50`) or split the task |
+| `Warning: 'bwrap' not found; ... Falling back to confirm mode` | `bwrap` isn't installed | Install bubblewrap (`apt install bubblewrap`) for unattended sandbox mode, or just use `confirm` |
+| `Error: command denied by safety policy` (agent) | The model tried a denylisted command (`sudo`, `rm -rf /`, …) | Nothing to fix — the guard worked. The agent sees the denial and adapts |
+| `Error: model 'X' is not downloaded` (agent) | A role model isn't pulled | `ollama pull X`, or point the role at a model you have |
 
 ---
 
@@ -325,6 +399,7 @@ aicli            Main script - all subcommands live here
 ai               Wrapper: shortcut for `aicli ask`
 aarch            Wrapper: shortcut for `aicli arch`
 abuild           Wrapper: shortcut for `aicli build`
+aagent           Wrapper: shortcut for `aicli agent`
 config.env       Settings (model name, context window) - edited via `aicli model|config`
 CONTRIBUTING.md  How to contribute
 LICENSE          MIT
