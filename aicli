@@ -60,6 +60,8 @@ AGENT_MAX_OUTPUT_CHARS=4000 # truncate individual tool outputs to this
 AGENT_CMD_TIMEOUT=60        # seconds: per shell command run by the agent
 AGENT_MODEL_TIMEOUT=300     # seconds: per model call timeout
 AGENT_HISTORY_KEPT=6        # builder prompt keeps this many recent tool exchanges verbatim
+CHAT_HISTORY_TURNS=10       # chat: conversation turns kept in each prompt
+CHAT_MAX_STEPS=15           # chat: max tool steps per turn before the model must reply
 
 if [ -f "$CONFIG_FILE" ]; then
     # config.env only ever holds simple KEY="value" assignments written by us.
@@ -85,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.5.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.1.0)"
+VERSION="2.6.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.2.0)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -101,7 +103,7 @@ esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.5.0 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.6.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -129,6 +131,7 @@ EXAMPLES:
     aarch "Design a modular Python web scraper with a config parser and DB logger."
     abuild "A 2-file Bash tool: config/net.conf and scripts/netmon.sh"
     aagent --mode confirm "Add a --verbose flag to bin/app and test it"
+    aagent --chat                   # interactive assistant with tools + memory
 HELP
 }
 
@@ -225,6 +228,9 @@ elif tool == "write":
     a2 = str(d.get("content", ""))
 elif tool == "run":
     a1 = str(d.get("command", ""))
+elif tool == "remember":
+    a1 = str(d.get("scope", "project"))
+    a2 = str(d.get("fact", ""))
 elif tool == "done":
     a1 = str(d.get("summary", ""))
 emit(tool, a1, a2)
@@ -309,6 +315,86 @@ agent_run_confirmed() {
     esac
 }
 
+# Extract ALL <TOOL>...</TOOL> blocks from stdin, separated by \x1e.
+extract_tool_json_all() {
+    perl -0777 -ne 'while (/<TOOL>(.*?)<\/TOOL>/sg) { print "$1\x1e"; }'
+}
+
+# Strip all <TOOL>...</TOOL> blocks from stdin (for narration display).
+strip_tool_blocks() {
+    perl -0777 -pe 's/<TOOL>.*?<\/TOOL>//sg'
+}
+
+# Execute one chat tool call. Needs (via dynamic scope): MODE, PROJ,
+# OUT_CHARS, NL, MEM_PROJ, MEM_GLOBAL. Sets TOOL_RESULT (truncated).
+chat_exec_tool() {
+    local tool="$1" a1="$2" a2="$3"
+    local sp="" out="" rc=0
+    case "$tool" in
+        '!parse-error')
+            TOOL_RESULT="That was not valid JSON, and no JSON object could be recovered. Emit clean JSON inside <TOOL> blocks." ;;
+        read)
+            if sp="$(sanitize_relpath "$a1")"; then
+                if [ -f "$PROJ/$sp" ]; then
+                    TOOL_RESULT="$(cat "$PROJ/$sp")"
+                else
+                    TOOL_RESULT="ERROR: file not found: $sp"
+                fi
+            else
+                TOOL_RESULT="ERROR: path rejected (must be relative, no ..): $a1"
+            fi ;;
+        ls)
+            if [ "$a1" = "." ] || [ "$a1" = "./" ] || [ -z "$a1" ]; then
+                sp="."
+            else
+                sp="$(sanitize_relpath "$a1")" || sp=""
+            fi
+            if [ -n "$sp" ] && [ -d "$PROJ/$sp" ]; then
+                TOOL_RESULT="$(ls -la "$PROJ/$sp")"
+            else
+                TOOL_RESULT="ERROR: not a directory or path rejected: $a1"
+            fi ;;
+        write)
+            if sp="$(sanitize_relpath "$a1")"; then
+                if [ "$MODE" = "dry-run" ]; then
+                    TOOL_RESULT="dry-run: would write ${#a2} chars to: $sp (not executed)"
+                else
+                    mkdir -p "$PROJ/$(dirname "$sp")"
+                    printf '%s\n' "$a2" > "$PROJ/$sp"
+                    TOOL_RESULT="wrote $sp"
+                fi
+            else
+                TOOL_RESULT="ERROR: path rejected (must be relative, no ..): $a1"
+            fi ;;
+        run)
+            if agent_cmd_denied "$a1"; then
+                TOOL_RESULT="ERROR: command denied by safety policy."
+            elif [ "$MODE" = "dry-run" ]; then
+                TOOL_RESULT="dry-run: would run: $a1 (not executed)"
+            elif [ "$MODE" = "sandbox" ]; then
+                out="$(agent_run_sandboxed "$a1" "$PROJ")"; rc=$?
+                TOOL_RESULT="[exit $rc]${NL}$out"
+            else
+                out="$(agent_run_confirmed "$a1")"; rc=$?
+                TOOL_RESULT="[exit $rc]${NL}$out"
+            fi ;;
+        remember)
+            local scope="project" memfile="$MEM_PROJ"
+            if [ "$a1" = "global" ]; then scope="global"; memfile="$MEM_GLOBAL"; fi
+            if [ -z "$a2" ]; then
+                TOOL_RESULT="ERROR: remember needs a fact."
+            else
+                mkdir -p "$(dirname "$memfile")"
+                [ -f "$memfile" ] || printf '# aicli memory\n\n' > "$memfile"
+                printf -- '- %s\n' "$a2" >> "$memfile"
+                TOOL_RESULT="remembered ($scope): $a2"
+            fi ;;
+        *)
+            TOOL_RESULT="ERROR: unknown tool '$tool'. Available: read, write, ls, run, remember." ;;
+    esac
+    TOOL_RESULT="$(printf '%s' "$TOOL_RESULT" | head -c "$OUT_CHARS")"
+}
+
 # aicli agent [--flags] "task description"
 cmd_agent() {
     local ARCH_M="$ARCHITECT_MODEL" BUILD_M="$BUILDER_MODEL" REV_M="$REVIEWER_MODEL"
@@ -316,6 +402,7 @@ cmd_agent() {
     local OUT_CHARS="$AGENT_MAX_OUTPUT_CHARS" MODEL_TIMEOUT="$AGENT_MODEL_TIMEOUT"
     local HIST_KEPT="$AGENT_HISTORY_KEPT"
     local DO_REVIEW=1
+    local CHAT=0 MAX_STEPS_SET=0
     local NL=$'\n'
 
     local -a CHANGED=() HIST=()
@@ -340,11 +427,12 @@ cmd_agent() {
                 MODE="$2"; shift 2 ;;
             --max-steps)
                 [ $# -ge 2 ] || { echo "Flag --max-steps needs a value." >&2; return 1; }
-                MAX_STEPS="$2"; shift 2 ;;
+                MAX_STEPS="$2"; MAX_STEPS_SET=1; shift 2 ;;
             --max-revisions)
                 [ $# -ge 2 ] || { echo "Flag --max-revisions needs a value." >&2; return 1; }
                 MAX_REV="$2"; shift 2 ;;
             --no-review) DO_REVIEW=0; shift ;;
+            --chat) CHAT=1; shift ;;
             --) shift; break ;;
             -*) echo "Unknown agent flag: $1" >&2; return 1 ;;
             *) break ;;
@@ -352,11 +440,18 @@ cmd_agent() {
     done
 
     local TASK="$*"
+    if [ "$CHAT" -eq 1 ]; then
+        # Interactive mode: remaining args (if any) are the opening message.
+        local CHAT_STEPS="$CHAT_MAX_STEPS"
+        [ "$MAX_STEPS_SET" -eq 1 ] && CHAT_STEPS="$MAX_STEPS"
+        cmd_agent_chat "$BUILD_M" "$MODE" "$CHAT_STEPS" "$TASK"
+        return $?
+    fi
     if [ -z "$TASK" ]; then
         echo "Usage: aicli agent [flags] \"task description\"" >&2
         echo "Flags: --architect-model M --builder-model M --reviewer-model M" >&2
         echo "       --mode sandbox|confirm|dry-run" >&2
-        echo "       --max-steps N --max-revisions N --no-review" >&2
+        echo "       --max-steps N --max-revisions N --no-review --chat" >&2
         return 1
     fi
 
@@ -724,6 +819,146 @@ $(agent_deliv_status)"
     echo "AGENT: run complete ($step steps, ${#CHANGED[@]} files changed, $missing_count deliverables missing)."
 }
 
+# aicli agent --chat ["initial message"]
+# Interactive assistant loop: the user chats, the model replies with a mix of
+# natural language and <TOOL> blocks. Tool blocks run, results feed back in;
+# a reply with no tool blocks is the assistant's message and ends the turn.
+cmd_agent_chat() {
+    # $1=model $2=mode $3=max tool steps per turn $4=initial message (maybe empty)
+    local MODEL="$1" MODE="$2" MAX_TURN_STEPS="$3" INIT_MSG="$4"
+    local OUT_CHARS="$AGENT_MAX_OUTPUT_CHARS" MODEL_TIMEOUT="$AGENT_MODEL_TIMEOUT"
+    local HIST_TURNS="$CHAT_HISTORY_TURNS"
+    local NL=$'\n'
+    local PROJ="$PWD"
+    local MEM_GLOBAL="$HOME/.aicli/memory.md"
+    local MEM_PROJ="$PROJ/.aicli/memory.md"
+    local -a HIST=()
+    local TOOL_RESULT=""
+
+    if ! ollama list | awk 'NR>1 {print $1}' | grep -qxF -- "$MODEL"; then
+        echo "Error: model '$MODEL' is not downloaded. Pull it first: ollama pull $MODEL" >&2
+        return 1
+    fi
+    if [ "$MODE" = "sandbox" ] && ! command -v bwrap >/dev/null 2>&1; then
+        echo "Warning: 'bwrap' not found; falling back to confirm mode." >&2
+        MODE="confirm"
+    fi
+
+    local MEMORY="(empty - nothing remembered yet)"
+    if [ -f "$MEM_GLOBAL" ] || [ -f "$MEM_PROJ" ]; then
+        MEMORY=""
+        [ -f "$MEM_GLOBAL" ] && MEMORY+="--- global memory ---${NL}$(cat "$MEM_GLOBAL")${NL}"
+        [ -f "$MEM_PROJ" ] && MEMORY+="--- project memory ($PROJ) ---${NL}$(cat "$MEM_PROJ")${NL}"
+    fi
+
+    local SYS
+    SYS="$(cat <<SYS_EOF
+[ROLE:CHAT]
+You are Muse, a helpful AI assistant running inside the aicli CLI, chatting
+with the user. Your working directory IS the project root.
+
+TOOLS - to act, include one or more <TOOL> blocks in your reply (they run in
+order, then you get the results and reply again):
+<TOOL>{"tool": "read", "path": "relative/path"}</TOOL>                     read a file
+<TOOL>{"tool": "write", "path": "relative/path", "content": "..."}</TOOL>  create/overwrite a whole file
+<TOOL>{"tool": "ls", "path": "relative/dir"}</TOOL>                      list a directory
+<TOOL>{"tool": "run", "command": "shell command"}</TOOL>                  run a shell command
+<TOOL>{"tool": "remember", "scope": "project", "fact": "..."}</TOOL>     remember a durable fact (scope: project or global)
+
+RULES:
+- When the user asks you to DO something, do it with tools. Say briefly what
+  you're doing, include the <TOOL> blocks, and when the work is finished reply
+  with a short summary and NO tool blocks - that reply is shown to the user.
+- If the request is vague or ambiguous, ask 1-2 clarifying questions INSTEAD
+  of calling tools.
+- Paths are relative to the project root. NEVER absolute, NEVER "..".
+- "content" is a JSON string: escape newlines as \\n and quotes as \\".
+- Use "remember" for durable facts: user preferences, project conventions,
+  toolchain choices. Never store secrets, tokens, or one-off details.
+- Keep replies concise and conversational.
+
+MEMORY (facts remembered from earlier sessions):
+$MEMORY
+SYS_EOF
+)"
+
+    # Nested: sees cmd_agent_chat's locals via dynamic scoping.
+    render_chat_prompt() {
+        # $1 = latest message (user text or tool results)
+        local p="$SYS"
+        p+="${NL}${NL}CONVERSATION (most recent last):${NL}"
+        local keep=$((HIST_TURNS * 2)) n=${#HIST[@]} start=0 i
+        if [ "$n" -gt "$keep" ]; then start=$((n - keep)); fi
+        for ((i = start; i < n; i++)); do
+            p+="${HIST[$i]}${NL}"
+        done
+        p+="${NL}LATEST:${NL}$1${NL}${NL}Reply now."
+        printf '%s' "$p"
+    }
+
+    echo "Muse ($MODEL) - project: $PROJ (mode=$MODE)"
+    echo "Commands: /quit  /clear  /help"
+    echo
+
+    local user_msg="$INIT_MSG" first=1
+    while true; do
+        if [ "$first" -eq 1 ] && [ -n "$INIT_MSG" ]; then
+            first=0
+        else
+            first=0
+            printf '> You: '
+            if ! IFS= read -r user_msg; then
+                echo; echo "Bye."
+                break
+            fi
+        fi
+        case "$user_msg" in
+            /quit|/exit) echo "Bye."; break ;;
+            /clear) HIST=(); echo "(history cleared)"; continue ;;
+            /help)
+                printf '%s\n' "Just talk. Ask me to read, write, run, or check things in this project." \
+                    "I can also remember facts: \"remember that I prefer tabs\". Commands: /quit /clear /help."
+                continue ;;
+            "") continue ;;
+        esac
+
+        HIST+=("You: $user_msg")
+        local latest="You: $user_msg" turn_steps=0
+        while true; do
+            turn_steps=$((turn_steps + 1))
+            if [ "$turn_steps" -gt "$MAX_TURN_STEPS" ]; then
+                echo "Muse: (stopping - too many tool steps this turn; try a smaller request)"
+                HIST+=("Muse: (turn stopped: step limit)")
+                break
+            fi
+            local response blocks narration
+            response="$(timeout "$MODEL_TIMEOUT" ollama run "$MODEL" <<< "$(render_chat_prompt "$latest")")" || response=""
+            blocks="$(printf '%s' "$response" | extract_tool_json_all)"
+            narration="$(printf '%s' "$response" | strip_tool_blocks | sed '/^[[:space:]]*$/d')"
+            if [ -n "$narration" ]; then
+                printf 'Muse: %s\n' "$(printf '%s' "$narration" | head -c 2000)"
+                HIST+=("Muse: $(printf '%s' "$narration" | head -c 500)")
+            fi
+            if [ -z "$blocks" ]; then
+                break  # text-only reply: the turn is over
+            fi
+            local b tool a1 a2 results_text="Tool results:"
+            while IFS= read -r -d $'\x1e' b || [ -n "$b" ]; do
+                [ -z "$b" ] && continue
+                local -a F=()
+                mapfile -d '' -t F < <(printf '%s' "$b" | parse_tool_call)
+                tool="${F[0]:-}" a1="${F[1]:-}" a2="${F[2]:-}"
+                printf '  [%s %s]\n' "$tool" "$(printf '%s' "$a1" | head -c 60)"
+                chat_exec_tool "$tool" "$a1" "$a2"
+                printf '  -> %s\n' "$(printf '%s' "$TOOL_RESULT" | head -n 1 | head -c 120)"
+                results_text+="${NL}- $tool $a1 => $(printf '%s' "$TOOL_RESULT" | head -n 1 | head -c 300)"
+                HIST+=("Muse [tool]: $tool ${a1:0:60}")
+            done < <(printf '%s' "$blocks")
+            latest="${results_text}${NL}Continue: if the work is done, reply with a short summary and no tool blocks."
+        done
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Subcommand parsing
 # ---------------------------------------------------------------------------
@@ -781,6 +1016,8 @@ case "$SUBCOMMAND" in
             echo "  AGENT_CMD_TIMEOUT=\"$AGENT_CMD_TIMEOUT\""
             echo "  AGENT_MODEL_TIMEOUT=\"$AGENT_MODEL_TIMEOUT\""
             echo "  AGENT_HISTORY_KEPT=\"$AGENT_HISTORY_KEPT\""
+            echo "  CHAT_HISTORY_TURNS=\"$CHAT_HISTORY_TURNS\""
+            echo "  CHAT_MAX_STEPS=\"$CHAT_MAX_STEPS\""
             echo
             echo "Change one with: aicli config <key> <value>"
             exit 0
@@ -819,7 +1056,7 @@ case "$SUBCOMMAND" in
                 save_config "AGENT_MODE" "$VALUE"
                 echo "AGENT_MODE updated to: $VALUE"
                 ;;
-            AGENT_MAX_STEPS|max-steps|AGENT_MAX_REVISIONS|max-revisions|AGENT_MAX_OUTPUT_CHARS|max-output-chars|AGENT_CMD_TIMEOUT|cmd-timeout|AGENT_MODEL_TIMEOUT|model-timeout|AGENT_HISTORY_KEPT|history-kept)
+            AGENT_MAX_STEPS|max-steps|AGENT_MAX_REVISIONS|max-revisions|AGENT_MAX_OUTPUT_CHARS|max-output-chars|AGENT_CMD_TIMEOUT|cmd-timeout|AGENT_MODEL_TIMEOUT|model-timeout|AGENT_HISTORY_KEPT|history-kept|CHAT_HISTORY_TURNS|chat-history|CHAT_MAX_STEPS|chat-max-steps)
                 [[ "$VALUE" =~ ^[1-9][0-9]*$ ]] || { echo "Usage: aicli config $KEY <positive integer>" >&2; exit 1; }
                 # Normalize the dashed alias to the canonical KEY name.
                 case "$KEY" in
@@ -829,6 +1066,8 @@ case "$SUBCOMMAND" in
                     cmd-timeout) KEY="AGENT_CMD_TIMEOUT" ;;
                     model-timeout) KEY="AGENT_MODEL_TIMEOUT" ;;
                     history-kept) KEY="AGENT_HISTORY_KEPT" ;;
+                    chat-history) KEY="CHAT_HISTORY_TURNS" ;;
+                    chat-max-steps) KEY="CHAT_MAX_STEPS" ;;
                 esac
                 save_config "$KEY" "$VALUE"
                 echo "$KEY updated to: $VALUE"
@@ -838,7 +1077,7 @@ case "$SUBCOMMAND" in
                 echo "  CHAT_MODEL, CONTEXT_WINDOW_FILES, ARCHITECT_MODEL, BUILDER_MODEL," >&2
                 echo "  REVIEWER_MODEL, AGENT_MODE, AGENT_MAX_STEPS, AGENT_MAX_REVISIONS," >&2
                 echo "  AGENT_MAX_OUTPUT_CHARS, AGENT_CMD_TIMEOUT, AGENT_MODEL_TIMEOUT," >&2
-                echo "  AGENT_HISTORY_KEPT" >&2
+                echo "  AGENT_HISTORY_KEPT, CHAT_HISTORY_TURNS, CHAT_MAX_STEPS" >&2
                 exit 1
                 ;;
         esac

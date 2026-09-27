@@ -289,6 +289,41 @@ aicli config reviewer-model qwen2.5-coder:32b
 
 (Each role falls back to `CHAT_MODEL` when unset, so this is opt-in.)
 
+#### Interactive chat: `aagent --chat`
+
+For back-and-forth work, `--chat` turns the agent into a conversational assistant with
+tools. Instead of one task in / one result out, you get a REPL: you talk, it acts with
+`read` / `write` / `ls` / `run`, narrates what it's doing, and waits for your next
+instruction. A reply with no tool calls is its message to you — so it can also ask
+clarifying questions instead of guessing.
+
+```bash
+cd ~/my-site
+aagent --chat
+# > You: add a dark mode toggle to the nav
+# Muse: I'll add a toggle button and wire it up in app.js.
+#   [write index.html]
+#   [write app.js]
+# Muse: Done. Want me to persist the choice in localStorage?
+# > You: yes
+```
+
+The chat model also has a **`remember`** tool and a **memory file** — it stores durable
+facts you tell it (preferences, project conventions, toolchain choices) in
+`.aicli/memory.md` (per-project) or `~/.aicli/memory.md` (global), and reads them back
+at the start of every session:
+
+```bash
+# > You: remember that this project deploys with `make flash`
+# Muse: Noted — I'll use `make flash` when you ask me to deploy.
+```
+
+Commands inside chat: `/quit` (or `/exit`), `/clear` (reset conversation history),
+`/help`. Pass an opening message directly: `aagent --chat "what's in this repo?"`.
+Chat uses the builder model and the configured autonomy `--mode`; each turn is capped
+at `CHAT_MAX_STEPS` tool calls (default 15) and the prompt keeps the last
+`CHAT_HISTORY_TURNS` turns (default 10).
+
 ### `aicli model`
 
 Manage the Ollama model `aicli` talks to. The choice is saved in `config.env`, so it
@@ -331,6 +366,8 @@ for you (one key at a time — other keys are preserved).
 | `AGENT_CMD_TIMEOUT` | `60` | Seconds before a single agent shell command is killed. |
 | `AGENT_MODEL_TIMEOUT` | `300` | Seconds before a single agent model call is killed. |
 | `AGENT_HISTORY_KEPT` | `6` | How many of the most recent builder tool exchanges are kept verbatim in each prompt (the deliverables checklist carries the rest of the state). |
+| `CHAT_HISTORY_TURNS` | `10` | How many conversation turns are kept in each `--chat` prompt. |
+| `CHAT_MAX_STEPS` | `15` | Max tool calls per `--chat` turn before the model must reply. |
 
 **Tuning `CONTEXT_WINDOW_FILES`:** higher values give the model more cross-file awareness
 (better imports, consistent config keys) at the cost of longer prompts and slower generation.
@@ -415,6 +452,7 @@ Key implementation details:
 | `AGENT: revision round produced no changes` | The builder couldn't act on the reviewer's notes | Check the notes in the output; simplify the task or use a stronger builder model |
 | `Warning: 'bwrap' not found; ... Falling back to confirm mode` | `bwrap` isn't installed | Install bubblewrap (`apt install bubblewrap`) for unattended sandbox mode, or just use `confirm` |
 | `Error: command denied by safety policy` (agent) | The model tried a denylisted command (`sudo`, `rm -rf /`, …) | Nothing to fix — the guard worked. The agent sees the denial and adapts |
+| `Muse: (stopping - too many tool steps this turn; ...)` (chat) | One chat turn needed more than `CHAT_MAX_STEPS` tool calls | Ask for the work in smaller pieces, or raise it: `aicli config chat-max-steps 25` |
 | `Error: model 'X' is not downloaded` (agent) | A role model isn't pulled | `ollama pull X`, or point the role at a model you have |
 
 ---
