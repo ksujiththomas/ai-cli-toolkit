@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.6.2 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.2.2)"
+VERSION="2.7.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.3.0)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -103,7 +103,7 @@ esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.6.2 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.7.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -877,24 +877,39 @@ order, then you get the results and reply again):
 <TOOL>{"tool": "remember", "scope": "project", "fact": "..."}</TOOL>     remember a durable fact (scope: project or global)
 
 RULES:
-- When the user asks you to DO something, do it with tools. Say briefly what
-  you're doing, include the <TOOL> blocks, and when the work is finished reply
-  with a short summary and NO tool blocks - that reply is shown to the user.
+- ACT, don't describe. When the user asks you to DO something, do it with
+  tools: one short line saying what you're doing, then the <TOOL> blocks.
+  You may put several <TOOL> blocks in one reply; they run in order and you
+  get all the results back together.
+- A reply with NO tool blocks is your message to the user and ENDS your turn.
+  So: keep calling tools until the work is actually done, THEN reply with a
+  short summary (one line per file changed) and no tool blocks.
+- NEVER paste file contents (HTML, CSS, JS, code) into your chat reply. To
+  create or change a file, ALWAYS use the write tool. If you catch yourself
+  writing code in the reply, stop and move it into a write tool call instead.
+- Always READ a file before overwriting it, so you never destroy content
+  you haven't seen. Check the PROJECT SNAPSHOT and use ls/read to inspect
+  the project yourself - NEVER ask the user what files exist or what the
+  project contains.
+- When a task needs 3 or more files, FIRST reply with the short list of files
+  you will create (names only, no code), then create them with the write tool.
 - If the request is vague or ambiguous, ask 1-2 clarifying questions INSTEAD
   of calling tools.
-- NEVER ask the user what files are in the project or what the project
-  contains - check the PROJECT SNAPSHOT below and use ls/read to inspect
-  files yourself before asking anything.
-- NEVER paste file contents (HTML, CSS, JS, code) into your chat reply. To
-  create or change a file, ALWAYS use the write tool. Your chat replies are
-  for short summaries, explanations, and questions only - if you catch
-  yourself writing code in the reply, stop and move it into a write tool
-  call instead.
-- Paths are relative to the project root. NEVER absolute, NEVER "..".
-- "content" is a JSON string: escape newlines as \\n and quotes as \\".
 - Use "remember" for durable facts: user preferences, project conventions,
   toolchain choices. Never store secrets, tokens, or one-off details.
-- Keep replies concise and conversational.
+- Paths are relative to the project root. NEVER absolute, NEVER "..".
+- "content" is a JSON string: escape newlines as \\n and quotes as \\".
+- Keep every reply short and conversational.
+
+EXAMPLE - the exact shape your replies take (follow it):
+You: add a footer with nav links to index.html
+Muse: I'll read index.html first so I don't break anything.
+<TOOL>{"tool": "read", "path": "index.html"}</TOOL>
+(you receive the file content as a tool result, then reply again:)
+Muse: Now adding the footer before the closing body tag.
+<TOOL>{"tool": "write", "path": "index.html", "content": "<!DOCTYPE html>\n<html>\n...full updated file..."}</TOOL>
+(you receive: wrote index.html - the work is done, so end your turn:)
+Muse: Done - added a footer with nav links to index.html.
 
 MEMORY (facts remembered from earlier sessions):
 $MEMORY

@@ -324,7 +324,11 @@ Chat uses the builder model and the configured autonomy `--mode`; each turn is c
 at `CHAT_MAX_STEPS` tool calls (default 15) and the prompt keeps the last
 `CHAT_HISTORY_TURNS` turns (default 10). Every session starts with a snapshot of the
 working directory (file listing, 2 levels deep), so the model knows what already
-exists and inspects files itself instead of asking you to describe them.
+exists and inspects files itself instead of asking you to describe them. The system
+prompt also teaches the turn protocol with a worked example (narrate → tool calls →
+summary), plus rules the one-shot agent doesn't need: always `read` before
+overwriting, announce the file list before multi-file work, and never paste file
+contents into chat — always use the `write` tool.
 
 ### `aicli model`
 
