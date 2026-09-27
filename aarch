@@ -1,2 +1,13 @@
-#!/bin/bash
-aicli arch "$@"
+#!/usr/bin/env bash
+# 'aarch' - shortcut for `aicli arch`.
+# Resolves the real aicli script sitting next to this file (symlink-safe),
+# so this works no matter how the repo was installed. If you installed via
+# the symlink method from the README, this wrapper is bypassed entirely:
+# `aarch` IS aicli, and aicli dispatches on its own invocation name.
+TARGET="${BASH_SOURCE[0]}"
+while [ -L "$TARGET" ]; do
+    DIR="$(cd -P "$(dirname "$TARGET")" && pwd)"
+    TARGET="$(readlink "$TARGET")"
+    [[ "$TARGET" != /* ]] && TARGET="$DIR/$TARGET"
+done
+exec "$(cd -P "$(dirname "$TARGET")" && pwd)/aicli" arch "$@"

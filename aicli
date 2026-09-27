@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
+#
+# aicli - Unified Local AI Developer Suite, powered by Ollama.
+#
+# One binary, four workflows:
+#   aicli ask     Quick shell assistant / single-prompt Q&A        (alias: ai)
+#   aicli arch    System architecture blueprints & JSON file trees  (alias: aarch)
+#   aicli build   Autonomous multi-file project builder            (alias: abuild)
+#   aicli model   View or switch the active Ollama model
+#   aicli config  View or change aicli settings
+#
+# The ai / aarch / abuild entry points are just symlinks (or tiny wrappers)
+# pointing at this script; the real subcommand is derived from how we were
+# invoked (see "alias dispatch" below).
 
-# Resolve actual script directory even when invoked via symlink
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Resolve the real script directory, even when invoked through symlinks.
+# ---------------------------------------------------------------------------
 TARGET_FILE="${BASH_SOURCE[0]}"
 while [ -L "$TARGET_FILE" ]; do
     TARGET_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
@@ -9,48 +26,130 @@ while [ -L "$TARGET_FILE" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$TARGET_FILE")" && pwd)"
 
-# Load configuration
+# ---------------------------------------------------------------------------
+# Dependency checks - fail fast with a helpful message instead of a
+# cryptic "command not found" halfway through a build.
+# ---------------------------------------------------------------------------
+for _dep in ollama python3 perl; do
+    if ! command -v "$_dep" >/dev/null 2>&1; then
+        echo "Error: required command '$_dep' was not found on PATH." >&2
+        echo "Install it first: Ollama from https://ollama.com, python3 and perl from your package manager." >&2
+        exit 127
+    fi
+done
+unset _dep
+
+# ---------------------------------------------------------------------------
+# Configuration. Defaults are overridden by config.env (KEY="value" lines).
+# ---------------------------------------------------------------------------
 CONFIG_FILE="$SCRIPT_DIR/config.env"
+
+CHAT_MODEL="qwen2.5-coder:7b"
+# How many of the most recently generated files are fed back to the model as
+# context while building the next file. Caps prompt size on large projects so
+# the model's context window isn't blown out by cumulative history.
+CONTEXT_WINDOW_FILES=5
+
 if [ -f "$CONFIG_FILE" ]; then
+    # config.env only ever holds simple KEY="value" assignments written by us.
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
-else
-    CHAT_MODEL="qwen2.5-coder:7b"
 fi
 
-VERSION="2.3.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.5.0)"
+# Persist one config key without clobbering the others.
+save_config() {
+    local key="$1" value="$2" tmp
+    tmp="$(mktemp)" || { echo "Error: could not create temp file." >&2; return 1; }
+    if [ -f "$CONFIG_FILE" ]; then
+        grep -v "^${key}=" "$CONFIG_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    printf '%s="%s"\n' "$key" "$value" >> "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+VERSION="2.3.1 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0)"
+
+# ---------------------------------------------------------------------------
+# Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
+# Translate the invocation name into the real subcommand so the README's
+# symlink install (`ln -s .../aicli ~/.local/bin/ai`) actually works.
+# ---------------------------------------------------------------------------
+case "$(basename "$0")" in
+    ai)     set -- ask "$@" ;;
+    aarch)  set -- arch "$@" ;;
+    abuild) set -- build "$@" ;;
+esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.3.0 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.3.1 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
 
 SUBCOMMANDS:
-    ask, -a       Quick shell assistant & single-prompt Q&A.
-    arch, -r      Architect system blueprints & JSON file-tree plans.
-    build, -b     Autonomous multi-file developer loop with cumulative context memory.
+    ask, -a       Quick shell assistant & single-prompt Q&A.            (alias: ai)
+    arch, -r      Architect system blueprints & JSON file-tree plans.   (alias: aarch)
+    build, -b     Autonomous multi-file developer loop with cumulative
+                  context memory.                                       (alias: abuild)
     model, -m     View or change the active Ollama local model.
+    config, -c    View or change aicli settings.
 
 FLAGS:
     -h, --help    Show this help message and exit.
     -v, --version Show version information.
 
 EXAMPLES:
-    aicli model                    Show current active model and available Ollama models.
-    aicli model llama3:8b          Switch active model to llama3:8b.
-    aicli ask "How do I check open ports using ss or netstat?"
-    aicli build "A 2-file Bash tool: config/net.conf and scripts/netmon.sh"
+    aicli model                          Show current model and downloaded models.
+    aicli model llama3:8b                Switch the active model to llama3:8b.
+    aicli config                         Show all current settings.
+    aicli config context-window 10       Keep the last 10 files as build context.
+    ai "How do I check open ports with ss?"
+    aarch "Design a modular Python web scraper with a config parser and DB logger."
+    abuild "A 2-file Bash tool: config/net.conf and scripts/netmon.sh"
 HELP
 }
 
-# Parse primary subcommand
-SUBCOMMAND="$1"
-shift
+# ---------------------------------------------------------------------------
+# Safety: never let the model write outside the current project directory.
+# The architect phase emits file paths; a confused (or jailbroken) model could
+# emit absolute paths or ".." segments. Reject anything that isn't a plain
+# relative path and normalize the rest.
+# ---------------------------------------------------------------------------
+sanitize_relpath() {
+    local raw="$1" part
+    case "$raw" in
+        ""|.) return 1 ;;   # empty path
+        /*)   return 1 ;;   # absolute path - never allowed
+    esac
+    raw="${raw#./}"         # tolerate a leading ./
+    local -a clean=()
+    local IFS='/'
+    read -r -a parts <<< "$raw"
+    for part in "${parts[@]}"; do
+        case "$part" in
+            ""|"."|"..") return 1 ;;  # empty, current-dir or parent-dir segment
+        esac
+        clean+=("$part")
+    done
+    [ "${#clean[@]}" -eq 0 ] && return 1
+    ( IFS='/'; printf '%s' "${clean[*]}" )
+}
+
+# Strip <think> blocks and markdown fences from model output.
+strip_model_noise() {
+    perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\s*\n?//g; s/```//g' | tr -d '\r'
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand parsing
+# ---------------------------------------------------------------------------
+SUBCOMMAND="${1:-}"
+if [ $# -gt 0 ]; then shift; fi
 
 case "$SUBCOMMAND" in
     model|-m)
-        NEW_MODEL="$1"
+        NEW_MODEL="${1:-}"
         if [ -z "$NEW_MODEL" ]; then
             echo "==================================================="
             echo " Active Ollama Model: ${CHAT_MODEL:-qwen2.5-coder:7b}"
@@ -62,10 +161,11 @@ case "$SUBCOMMAND" in
             exit 0
         fi
 
-        # Verify model exists in Ollama
-        if ! ollama list | grep -q "^${NEW_MODEL}:\|^${NEW_MODEL} "; then
+        # Exact match against the downloaded model names.
+        if ! ollama list | awk 'NR>1 {print $1}' | grep -qxF -- "$NEW_MODEL"; then
             echo "Warning: Model '$NEW_MODEL' is not currently downloaded in Ollama."
-            read -p "Do you want to pull '$NEW_MODEL' now? (y/N): " choice
+            choice=""
+            read -r -p "Do you want to pull '$NEW_MODEL' now? (y/N): " choice
             case "$choice" in
                 y|Y)
                     ollama pull "$NEW_MODEL"
@@ -77,14 +177,43 @@ case "$SUBCOMMAND" in
             esac
         fi
 
-        echo "CHAT_MODEL=\"$NEW_MODEL\"" > "$CONFIG_FILE"
+        save_config "CHAT_MODEL" "$NEW_MODEL"
         echo "Active model updated to: $NEW_MODEL"
+        ;;
+
+    config|-c)
+        KEY="${1:-}"
+        VALUE="${2:-}"
+        if [ -z "$KEY" ]; then
+            echo "Current aicli settings ($CONFIG_FILE):"
+            echo "  CHAT_MODEL=\"$CHAT_MODEL\""
+            echo "  CONTEXT_WINDOW_FILES=\"$CONTEXT_WINDOW_FILES\""
+            echo
+            echo "Change one with: aicli config <key> <value>"
+            exit 0
+        fi
+        case "$KEY" in
+            CHAT_MODEL)
+                [ -z "$VALUE" ] && { echo "Usage: aicli config CHAT_MODEL <model_name>" >&2; exit 1; }
+                save_config "CHAT_MODEL" "$VALUE"
+                echo "CHAT_MODEL updated to: $VALUE"
+                ;;
+            CONTEXT_WINDOW_FILES|context-window)
+                [[ "$VALUE" =~ ^[1-9][0-9]*$ ]] || { echo "Usage: aicli config context-window <positive integer>" >&2; exit 1; }
+                save_config "CONTEXT_WINDOW_FILES" "$VALUE"
+                echo "CONTEXT_WINDOW_FILES updated to: $VALUE"
+                ;;
+            *)
+                echo "Error: unknown setting '$KEY'. Known settings: CHAT_MODEL, CONTEXT_WINDOW_FILES" >&2
+                exit 1
+                ;;
+        esac
         ;;
 
     ask|-a)
         PROMPT="$*"
         if [ -z "$PROMPT" ]; then
-            echo "Usage: aicli ask \"Your question or request\""
+            echo "Usage: aicli ask \"Your question or request\"" >&2
             exit 1
         fi
         ollama run "$CHAT_MODEL" "$PROMPT"
@@ -93,28 +222,31 @@ case "$SUBCOMMAND" in
     arch|-r)
         PROMPT="$*"
         if [ -z "$PROMPT" ]; then
-            echo "Usage: aicli arch \"Describe the system architecture to design\""
+            echo "Usage: aicli arch \"Describe the system architecture to design\"" >&2
             exit 1
         fi
         ARCH_PROMPT="You are a Principal Software Architect.
 Provide a high-level system architectural blueprint, component design, and a JSON file tree.
 
 Project Request: $PROMPT"
-        ollama run "$CHAT_MODEL" "$ARCH_PROMPT"
+        # Feed the prompt via stdin (<<<) rather than an unquoted heredoc so
+        # model output interpolated into later prompts can never be
+        # re-expanded as shell code.
+        ollama run "$CHAT_MODEL" <<< "$ARCH_PROMPT"
         ;;
 
     build|-b)
         PROJECT_REQ="$*"
         if [ -z "$PROJECT_REQ" ]; then
-            echo "Usage: aicli build \"Describe the project you want to auto-build\""
+            echo "Usage: aicli build \"Describe the project you want to auto-build\"" >&2
             exit 1
         fi
 
         echo -e "\n==================================================="
         echo " PHASE 1: Architecting System & File Tree (Model: $CHAT_MODEL)"
-        echo -e "==================================================-\n"
+        echo -e "===================================================\n"
 
-        ARCH_PROMPT="You are a Lead Software Architect.
+        BASE_ARCH_PROMPT="You are a Lead Software Architect.
 Decompose this project into discrete, modular code files.
 OUTPUT ONLY VALID JSON raw array with no markdown formatting or extra text.
 
@@ -126,58 +258,114 @@ JSON Format:
   }
 ]
 
+Rules for paths:
+- Every path MUST be relative to the project root (e.g. \"src/main.py\").
+- NEVER use absolute paths and NEVER use \"..\" segments.
+
 Project Request: $PROJECT_REQ"
 
-        RAW_PLAN=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
-$ARCH_PROMPT
-INSIDE_HEREDOC
-)
+        STRICT_ARCH_PROMPT="$BASE_ARCH_PROMPT
 
-        CLEAN_JSON=$(echo "$RAW_PLAN" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```json//g; s/```//g' | tr -d '\r')
+STRICT OUTPUT REQUIREMENT: Your previous response was not valid JSON.
+Respond now with ONLY the raw JSON array. No prose, no markdown fences, no <think> blocks."
 
-        if ! echo "$CLEAN_JSON" | python3 -m json.tool >/dev/null 2>&1; then
-            echo "Error: Architect failed to generate valid JSON plan."
-            echo "Raw output was:"
-            echo "$RAW_PLAN"
+        ARCH_PROMPT="$BASE_ARCH_PROMPT"
+        PLAN_ATTEMPTS=0
+        MAX_PLAN_ATTEMPTS=3
+        CLEAN_JSON=""
+        while :; do
+            RAW_PLAN="$(ollama run "$CHAT_MODEL" <<< "$ARCH_PROMPT")"
+            CLEAN_JSON="$(printf '%s' "$RAW_PLAN" | strip_model_noise)"
+
+            if printf '%s' "$CLEAN_JSON" | python3 -m json.tool >/dev/null 2>&1; then
+                break
+            fi
+
+            PLAN_ATTEMPTS=$((PLAN_ATTEMPTS + 1))
+            if [ "$PLAN_ATTEMPTS" -ge "$MAX_PLAN_ATTEMPTS" ]; then
+                echo "Error: Architect failed to generate a valid JSON plan after $MAX_PLAN_ATTEMPTS attempts."
+                echo "Last raw output was:"
+                echo "$RAW_PLAN"
+                exit 1
+            fi
+            echo "Architect output was not valid JSON - retrying ($PLAN_ATTEMPTS/$MAX_PLAN_ATTEMPTS) with stricter instructions..."
+            ARCH_PROMPT="$STRICT_ARCH_PROMPT"
+        done
+
+        # Parse the plan ONCE into bash arrays (NUL-delimited so that
+        # multi-line descriptions stay aligned with their paths).
+        mapfile -d '' -t FILE_PATHS < <(printf '%s' "$CLEAN_JSON" | python3 -c \
+            'import sys, json; [sys.stdout.write(str(x.get("path", "")) + "\x00") for x in json.load(sys.stdin)]')
+        mapfile -d '' -t FILE_DESCS < <(printf '%s' "$CLEAN_JSON" | python3 -c \
+            'import sys, json; [sys.stdout.write(str(x.get("description", "")) + "\x00") for x in json.load(sys.stdin)]')
+
+        FILE_COUNT="${#FILE_PATHS[@]}"
+        if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "Error: Architect returned an empty file plan." >&2
             exit 1
         fi
-
-        FILE_COUNT=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(len(json.load(sys.stdin)))")
         echo "Architect generated a $FILE_COUNT-file plan."
 
         echo -e "\n==================================================="
         echo " PHASE 2: Autonomous Code Building Loop (Model: $CHAT_MODEL)"
         echo -e "===================================================\n"
 
-        ACCUMULATED_CONTEXT=""
+        # Cumulative context memory: every generated file is appended here so
+        # later files stay consistent (imports, paths, shared config keys).
+        # Only the most recent CONTEXT_WINDOW_FILES are fed back, to keep the
+        # prompt inside the model's context window on large projects.
+        declare -a CONTEXT_BLOCKS=()
 
-        for (( i=0; i<$FILE_COUNT; i++ )); do
-            FILE_PATH=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)[$i]['path'])")
-            FILE_DESC=$(echo "$CLEAN_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)[$i]['description'])")
+        build_context() {
+            local total="${#CONTEXT_BLOCKS[@]}" start=0 j out=""
+            if [ "$total" -gt "$CONTEXT_WINDOW_FILES" ]; then
+                start=$((total - CONTEXT_WINDOW_FILES))
+            fi
+            for (( j = start; j < total; j++ )); do
+                out+="${CONTEXT_BLOCKS[j]}"$'\n'
+            done
+            printf '%s' "$out"
+        }
+
+        for (( i = 0; i < FILE_COUNT; i++ )); do
+            RAW_PATH="${FILE_PATHS[$i]}"
+            FILE_DESC="${FILE_DESCS[$i]}"
+
+            # Security gate: refuse absolute paths and ".." escapes.
+            if ! SAFE_PATH="$(sanitize_relpath "$RAW_PATH")"; then
+                echo "Error: architect returned an unsafe file path ('$RAW_PATH')." >&2
+                echo "Paths must be relative to the project root with no '..' segments. Aborting." >&2
+                exit 1
+            fi
 
             echo "---------------------------------------------------"
-            echo "Building [$((i+1))/$FILE_COUNT]: $FILE_PATH"
+            echo "Building [$((i + 1))/$FILE_COUNT]: $SAFE_PATH"
             echo "Purpose: $FILE_DESC"
             echo "---------------------------------------------------"
 
-            mkdir -p "$(dirname "$FILE_PATH")"
+            mkdir -p "$(dirname "$SAFE_PATH")"
 
-            BUILD_PROMPT="You are a Senior Developer. Write ONLY the implementation for: $FILE_PATH
+            CONTEXT_TEXT="$(build_context)"
+            if [ -z "$CONTEXT_TEXT" ]; then
+                CONTEXT_TEXT="None yet (this is the first file)."
+            fi
 
-File Path: $FILE_PATH
+            BUILD_PROMPT="You are a Senior Developer. Write ONLY the implementation for: $SAFE_PATH
+
+File Path: $SAFE_PATH
 Requirements: $FILE_DESC
 
 Overall Project Request: $PROJECT_REQ
 
-PREVIOUSLY GENERATED FILES IN THIS PROJECT:
-${ACCUMULATED_CONTEXT:-None yet (this is the first file).}
+PREVIOUSLY GENERATED FILES IN THIS PROJECT (most recent $CONTEXT_WINDOW_FILES shown):
+$CONTEXT_TEXT
 
 CRITICAL INSTRUCTION:
-Write ONLY the code for $FILE_PATH.
+Write ONLY the code for $SAFE_PATH.
 Wrap your entire code response inside <FILE_CONTENT> and </FILE_CONTENT> tags.
 
 Rules:
-1. CONFIG FILES ($FILE_PATH): Output ONLY variable exports. Do NOT write script logic or source statements inside config files.
+1. CONFIG FILES ($SAFE_PATH): Output ONLY variable exports. Do NOT write script logic or source statements inside config files.
 2. PATH RESOLUTION & SOURCING:
    - Always initialize SCRIPT_DIR: SCRIPT_DIR=\"\$(cd \"\$(dirname \"\${BASH_SOURCE[0]}\")\" && pwd)\"
    - For files located inside subdirectories like 'bin/', always source other modules relative to the project root using '..', e.g., source \"\$SCRIPT_DIR/../config/settings.conf\" and source \"\$SCRIPT_DIR/../lib/module.sh\". Never assume a flat execution context.
@@ -185,34 +373,28 @@ Rules:
 4. SAFE MATH & PARSING:
    - Perform percentage calculations directly inside AWK (e.g. awk '/MemTotal/ {t=\$2} /MemAvailable/ {a=\$2} END {printf \"%.2f\", (t-a)/t*100}' /proc/meminfo).
    - Do NOT pass raw AWK variables into 'bc' without fallback default values.
-5. Do NOT repeat code from other files inside $FILE_PATH."
+5. Do NOT repeat code from other files inside $SAFE_PATH."
 
-            FILE_CODE=$(ollama run "$CHAT_MODEL" <<INSIDE_HEREDOC
-$BUILD_PROMPT
-INSIDE_HEREDOC
-)
+            # Note: prompts go in via <<< so embedded model output is never
+            # re-expanded by the shell (prevents $(...) injection).
+            FILE_CODE="$(ollama run "$CHAT_MODEL" <<< "$BUILD_PROMPT")"
 
-            CLEAN_CODE=$(echo "$FILE_CODE" | perl -0777 -ne 'if (/<FILE_CONTENT>(.*?)<\/FILE_CONTENT>/s) { print $1; } else { print $_; }')
-            CLEAN_CODE=$(echo "$CLEAN_CODE" | perl -0777 -pe 's/<think>.*?<\/think>//gs; s/```[a-zA-Z]*\n//g; s/```//g' | sed '/^[[:space:]]*$/d')
+            CLEAN_CODE="$(printf '%s' "$FILE_CODE" | perl -0777 -ne 'if (/<FILE_CONTENT>(.*?)<\/FILE_CONTENT>/s) { print $1; } else { print $_; }' | strip_model_noise)"
 
-            echo "$CLEAN_CODE" > "$FILE_PATH"
+            printf '%s\n' "$CLEAN_CODE" > "$SAFE_PATH"
 
-            if [[ "$FILE_PATH" == *.sh ]] || [[ "$FILE_PATH" == bin/* ]] || head -n 1 "$FILE_PATH" | grep -q "^#!"; then
-                chmod +x "$FILE_PATH"
+            if [[ "$SAFE_PATH" == *.sh ]] || [[ "$SAFE_PATH" == bin/* ]] || head -n 1 "$SAFE_PATH" | grep -q '^#!'; then
+                chmod +x "$SAFE_PATH"
             fi
 
-            ACCUMULATED_CONTEXT="${ACCUMULATED_CONTEXT}
-# --- START FILE: $FILE_PATH ---
-$CLEAN_CODE
-# --- END FILE: $FILE_PATH ---
-"
+            CONTEXT_BLOCKS+=("$(printf '# --- START FILE: %s ---\n%s\n# --- END FILE: %s ---\n' "$SAFE_PATH" "$CLEAN_CODE" "$SAFE_PATH")")
 
-            echo "Saved -> $FILE_PATH ($(wc -l < "$FILE_PATH") lines)"
+            echo "Saved -> $SAFE_PATH ($(wc -l < "$SAFE_PATH") lines)"
         done
 
         echo -e "\n==================================================="
         echo " SUCCESS: Project build complete!"
-        echo -e "==================================================-\n"
+        echo -e "===================================================\n"
         ;;
 
     -v|--version)
@@ -224,8 +406,8 @@ $CLEAN_CODE
         ;;
 
     *)
-        echo "Error: Unknown subcommand '$SUBCOMMAND'"
-        echo "Run 'aicli --help' for usage instructions."
+        echo "Error: Unknown subcommand '$SUBCOMMAND'" >&2
+        echo "Run 'aicli --help' for usage instructions." >&2
         exit 1
         ;;
 esac
