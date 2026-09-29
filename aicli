@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.7.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.3.0)"
+VERSION="2.7.1 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.3.1)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -103,7 +103,7 @@ esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.7.0 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.7.1 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -1061,8 +1061,8 @@ case "$SUBCOMMAND" in
             exit 0
         fi
         case "$KEY" in
-            CHAT_MODEL)
-                [ -z "$VALUE" ] && { echo "Usage: aicli config CHAT_MODEL <model_name>" >&2; exit 1; }
+            CHAT_MODEL|chat-model)
+                [ -z "$VALUE" ] && { echo "Usage: aicli config chat-model <model_name>" >&2; exit 1; }
                 save_config "CHAT_MODEL" "$VALUE"
                 echo "CHAT_MODEL updated to: $VALUE"
                 ;;
