@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.9.1 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.1)"
+VERSION="2.9.2 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.2)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -666,6 +666,35 @@ while j < len(lines) and lines[j].startswith('  - ['):
     j += 1
 PYEOF
     }
+    # All unchecked section names under a file's box (empty when none).
+    # v1.5.2: feeds the post-write nudge so the builder checks off what it wrote.
+    project_open_sections() {
+        local pf="$PROJ/.aicli/progress.md"
+        [ -f "$pf" ] || return 0
+        python3 - "$pf" "$1" <<'PYEOF2'
+import sys, re
+pf, target = sys.argv[1], sys.argv[2]
+def norm(x):
+    return re.sub(r'[^a-z0-9]', '', x.lower())
+lines = open(pf).read().split(chr(10))
+fi = None
+for i, ln in enumerate(lines):
+    m = re.match(r'- \[[ x]\] (\S+)\s*--', ln)
+    if m and norm(m.group(1)) == norm(target):
+        fi = i
+        break
+if fi is None:
+    sys.exit(0)
+j = fi + 1
+out = []
+while j < len(lines) and lines[j].startswith('  - ['):
+    m = re.match(r'  - \[ \] (.*)', lines[j])
+    if m:
+        out.append(m.group(1))
+    j += 1
+print(chr(10).join(out))
+PYEOF2
+    }
     agent_render_history() {
         local n=${#HIST[@]} start=0 i
         if [ "$n" -gt "$HIST_KEPT" ]; then start=$((n - HIST_KEPT)); fi
@@ -1058,6 +1087,12 @@ SYS_EOF
                                     [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
                                 fi
                                 tool_result="wrote $sp"
+                                if [ "$PROJECT" -eq 1 ]; then
+                                    _open="$(project_open_sections "$sp")"
+                                    if [ -n "$_open" ]; then
+                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Call the progress tool now to check off every section you just finished writing."
+                                    fi
+                                fi
                             fi
                         else
                             tool_result="ERROR: path rejected (must be relative, no ..): $a1"
@@ -1087,6 +1122,12 @@ SYS_EOF
                                     [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
                                 fi
                                 tool_result="appended ${#a2} chars to $sp"
+                                if [ "$PROJECT" -eq 1 ]; then
+                                    _open="$(project_open_sections "$sp")"
+                                    if [ -n "$_open" ]; then
+                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Call the progress tool now to check off every section you just finished writing."
+                                    fi
+                                fi
                             fi
                         else
                             tool_result="ERROR: path rejected (must be relative, no ..): $a1"
