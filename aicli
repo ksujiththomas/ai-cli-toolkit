@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.8.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.4.0)"
+VERSION="2.9.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.0)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -426,7 +426,7 @@ cmd_agent() {
     local OUT_CHARS="$AGENT_MAX_OUTPUT_CHARS" MODEL_TIMEOUT="$AGENT_MODEL_TIMEOUT"
     local HIST_KEPT="$AGENT_HISTORY_KEPT"
     local DO_REVIEW=1
-    local CHAT=0 MAX_STEPS_SET=0 PROJECT=0
+    local CHAT=0 MAX_STEPS_SET=0 MAX_REV_SET=0 PROJECT=0 THOROUGH=0
     local NL=$'\n'
 
     local -a CHANGED=() HIST=()
@@ -454,9 +454,10 @@ cmd_agent() {
                 MAX_STEPS="$2"; MAX_STEPS_SET=1; shift 2 ;;
             --max-revisions)
                 [ $# -ge 2 ] || { echo "Flag --max-revisions needs a value." >&2; return 1; }
-                MAX_REV="$2"; shift 2 ;;
+                MAX_REV="$2"; MAX_REV_SET=1; shift 2 ;;
             --no-review) DO_REVIEW=0; shift ;;
             --project) PROJECT=1; shift ;;
+            --thorough) THOROUGH=1; shift ;;
             --chat) CHAT=1; shift ;;
             --) shift; break ;;
             -*) echo "Unknown agent flag: $1" >&2; return 1 ;;
@@ -476,8 +477,9 @@ cmd_agent() {
         echo "Usage: aicli agent [flags] \"task description\"" >&2
         echo "Flags: --architect-model M --builder-model M --reviewer-model M" >&2
         echo "       --mode sandbox|confirm|dry-run" >&2
-        echo "       --max-steps N --max-revisions N --no-review --project --chat" >&2
+        echo "       --max-steps N --max-revisions N --no-review --project --thorough --chat" >&2
         echo "       --project: section-by-section build with a progress checklist" >&2
+        echo "       --thorough: plan critique loop, verify-per-section, higher caps (slow)" >&2
         return 1
     fi
 
@@ -486,9 +488,14 @@ cmd_agent() {
         *) echo "Error: --mode must be sandbox, confirm, or dry-run." >&2; return 1 ;;
     esac
     [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "Error: --max-steps must be a positive integer." >&2; return 1; }
+
     [[ "$MAX_REV" =~ ^[0-9]+$ ]] || { echo "Error: --max-revisions must be a non-negative integer." >&2; return 1; }
     if [ "$PROJECT" -eq 1 ] && [ "$MAX_STEPS_SET" -eq 0 ]; then
         MAX_STEPS=40  # section-by-section builds need more steps
+    fi
+    if [ "$THOROUGH" -eq 1 ]; then
+        [ "$MAX_STEPS_SET" -eq 0 ] && MAX_STEPS=80
+        [ "$MAX_REV_SET" -eq 0 ] && MAX_REV=5
     fi
 
     local m
@@ -511,6 +518,12 @@ cmd_agent() {
     # The agent's whole world: everything it reads/writes happens under here.
     local PROJ="$PWD"
 
+    # Run log: mirror everything to .aicli/run-<timestamp>.log so progress can
+    # be watched live (tail -f) or reviewed after the run.
+    local AGENT_LOG="$PROJ/.aicli/run-$(date +%Y%m%d-%H%M%S)-$$.log"
+    mkdir -p "$PROJ/.aicli"
+    exec > >(tee -a "$AGENT_LOG") 2>&1
+    echo "AGENT: logging this run to $AGENT_LOG"
     # ---- Small helpers, defined here so they see cmd_agent's locals ----
     # (bash uses dynamic scoping: functions called from inside cmd_agent
     # can read its local variables).
@@ -626,6 +639,33 @@ PYEOF
         [ -f "$pf" ] || return 0
         grep -E '^\s*- \[ \]' "$pf" | sed -E 's/^\s*- \[ \] //'
     }
+    # First unchecked section name under a file's box (empty when none/sectionless).
+    project_first_open_section() {
+        local pf="$PROJ/.aicli/progress.md"
+        [ -f "$pf" ] || return 0
+        python3 - "$pf" "$1" <<'PYEOF'
+import sys, re
+pf, target = sys.argv[1], sys.argv[2]
+def norm(s):
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+lines = open(pf).read().split('\n')
+fi = None
+for i, ln in enumerate(lines):
+    m = re.match(r'- \[[ x]\] (\S+)\s*--', ln)
+    if m and norm(m.group(1)) == norm(target):
+        fi = i
+        break
+if fi is None:
+    sys.exit(0)
+j = fi + 1
+while j < len(lines) and lines[j].startswith('  - ['):
+    m = re.match(r'  - \[ \] (.*)', lines[j])
+    if m:
+        print(m.group(1))
+        break
+    j += 1
+PYEOF
+    }
     agent_render_history() {
         local n=${#HIST[@]} start=0 i
         if [ "$n" -gt "$HIST_KEPT" ]; then start=$((n - HIST_KEPT)); fi
@@ -662,69 +702,155 @@ PYEOF
         done | sort
     }
 
+    # Project snapshot for the architect: plan against what actually exists.
+    agent_snapshot() {
+        local snap="(empty directory)"
+        if [ -d "$PROJ" ]; then
+            snap="$(cd "$PROJ" && ls -la 2>/dev/null | head -25)"
+            local snap_files
+            snap_files="$(cd "$PROJ" && find . -maxdepth 2 -not -path './.git*' -not -path './.git/*' -not -path './.aicli*' -not -path './.aicli/*' | sort | head -60)"
+            [ -n "$snap_files" ] && snap+="${NL}--- files (2 levels deep) ---${NL}${snap_files}"
+            snap="$(printf '%s' "$snap" | head -c 2000)"
+        fi
+        printf '%s' "$snap"
+    }
+    # (Re)build the deliverables arrays from $PLAN_RAW. Returns 1 when empty.
+    agent_parse_deliverables() {
+        DELIV_PATHS=() DELIV_PURPOSE=() DELIV_DONE=() DELIV_SECS=()
+        [ -n "$PLAN_RAW" ] || return 1
+        local DLV_RAW
+        DLV_RAW="$(printf '%s' "$PLAN_RAW" | parse_deliverables)" || return 1
+        local -a DLV=()
+        mapfile -t DLV <<< "$DLV_RAW"
+        local dl dp rest rest2
+        for dl in "${DLV[@]}"; do
+            dp="${dl%%|*}"
+            rest="${dl#*|}"
+            if dp="$(sanitize_relpath "$dp")"; then
+                DELIV_PATHS+=("$dp")
+                DELIV_PURPOSE+=("${rest%%|*}")
+                rest2="${rest#*|}"
+                [ "$rest2" = "$rest" ] && rest2=""
+                DELIV_SECS+=("$rest2")
+                DELIV_DONE+=(0)
+            fi
+        done
+        [ "${#DELIV_PATHS[@]}" -gt 0 ]
+    }
+    agent_architect_prompt() {
+        # $1 = extra instructions (e.g. thorough detail, or critique notes)
+        local extra="${1:-}"
+        local sections_instr=""
+        if [ "$PROJECT" -eq 1 ]; then
+            sections_instr="Break EVERY file into 2-5 concrete build sections, in the order they should be
+written, each small enough for one model generation. "
+        fi
+        local detail_instr="After the tags, a short numbered plan (5-10 concrete steps)."
+        if [ "$THOROUGH" -eq 1 ]; then
+            detail_instr="After the tags, a DETAILED numbered plan: for every file, list its sections
+in build order with 1-2 lines each on what that section must contain and how it
+connects to the others. Take your time; a precise plan is the whole point."
+        fi
+        cat <<AP_EOF
+[ROLE:ARCHITECT]
+You are a software architect. Your reply has TWO parts.
+
+PART 1 - deliverables. List every file this task requires (new files to create
+and existing files to modify) as a JSON array inside <DELIVERABLES> tags.
+Paths are relative to the project root, never absolute, never containing '..'.
+${sections_instr}Example:
+<DELIVERABLES>[{"path": "index.html", "purpose": "page structure", "sections": ["head and navigation", "hero section"]}, {"path": "styles.css", "purpose": "styling", "sections": ["base layout"]}]</DELIVERABLES>
+
+PART 2 - plan. ${detail_instr}
+${extra}
+PROJECT SNAPSHOT (existing files - plan against what is actually here):
+$(agent_snapshot)
+
+Task: $TASK
+AP_EOF
+    }
+
     # ---- Phase 1: architect plans + deliverables ----
+    local T_ARCH_START=$SECONDS
     if [ "$PROJECT" -eq 1 ]; then
         echo "AGENT phase 1/3: architect ($ARCH_M) planning (project mode: sections)..."
     else
         echo "AGENT phase 1/3: architect ($ARCH_M) planning..."
     fi
+    echo "AGENT: loading $ARCH_M (first load from disk can take a minute)..."
     local PLAN_RAW
-    if [ "$PROJECT" -eq 1 ]; then
-        PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "[ROLE:ARCHITECT]
-You are a software architect. Your reply has TWO parts.
+    PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "$(agent_architect_prompt)")" || PLAN_RAW=""
 
-PART 1 - deliverables. List every file this task requires (new files to create
-and existing files to modify) as a JSON array inside <DELIVERABLES> tags.
-Paths are relative to the project root, never absolute, never containing '..'.
-Break EVERY file into 2-5 concrete build sections, in the order they should be
-written. Example:
-<DELIVERABLES>[{\"path\": \"index.html\", \"purpose\": \"page structure\", \"sections\": [\"head and navigation\", \"hero section\", \"main content\", \"footer\"]}, {\"path\": \"styles.css\", \"purpose\": \"styling\", \"sections\": [\"base layout\", \"components\"]}]</DELIVERABLES>
-
-PART 2 - plan. After the tags, a short numbered plan (5-10 concrete steps).
-
-Task: $TASK")" || PLAN_RAW=""
-    else
-        PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "[ROLE:ARCHITECT]
-You are a software architect. Your reply has TWO parts.
-
-PART 1 - deliverables. List every file this task requires (new files to create
-and existing files to modify) as a JSON array inside <DELIVERABLES> tags.
-Paths are relative to the project root, never absolute, never containing '..'.
-Example:
-<DELIVERABLES>[{\"path\": \"index.html\", \"purpose\": \"page structure\"}, {\"path\": \"styles.css\", \"purpose\": \"styling\"}]</DELIVERABLES>
-
-PART 2 - plan. After the tags, a short numbered plan (5-10 concrete steps).
-
-Task: $TASK")" || PLAN_RAW=""
-    fi
-
-    if [ -n "$PLAN_RAW" ]; then
-        local DLV_RAW
-        if DLV_RAW="$(printf '%s' "$PLAN_RAW" | parse_deliverables)"; then
-            local -a DLV=()
-            mapfile -t DLV <<< "$DLV_RAW"
-            local dl dp rest rest2
-            for dl in "${DLV[@]}"; do
-                dp="${dl%%|*}"
-                rest="${dl#*|}"
-                if dp="$(sanitize_relpath "$dp")"; then
-                    DELIV_PATHS+=("$dp")
-                    DELIV_PURPOSE+=("${rest%%|*}")
-                    rest2="${rest#*|}"
-                    [ "$rest2" = "$rest" ] && rest2=""
-                    DELIV_SECS+=("$rest2")
-                    DELIV_DONE+=(0)
-                fi
-            done
-        fi
-    fi
-    if [ "${#DELIV_PATHS[@]}" -eq 0 ]; then
+    if ! agent_parse_deliverables; then
         echo "AGENT warning: architect produced no usable deliverables list; the done-gate is disabled for this run." >&2
         PROJECT=0  # fall back to plain mode; nothing to track sections against
     elif [ "$PROJECT" -eq 1 ]; then
         project_progress_init
         echo "AGENT: project checklist written to .aicli/progress.md"
     fi
+
+    # ---- Phase 1b: thorough plan critique loop ----
+    local PLAN_CRIT_ROUNDS=0
+    if [ "$THOROUGH" -eq 1 ] && [ "${#DELIV_PATHS[@]}" -gt 0 ]; then
+        local CRIT_M="$REV_M"
+        if [ "$DO_REVIEW" -eq 0 ]; then
+            CRIT_M="$ARCH_M"
+            echo "AGENT: --no-review given; the architect will critique its own plan."
+        fi
+        local crit_round=0 crit_done=0
+        while [ "$crit_round" -lt 3 ] && [ "$crit_done" -eq 0 ]; do
+            crit_round=$((crit_round + 1))
+            PLAN_CRIT_ROUNDS="$crit_round"
+            echo "AGENT: plan critique round $crit_round/3 ($CRIT_M)..."
+            local CRIT_RAW
+            CRIT_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$CRIT_M" <<< "[ROLE:PLAN-CRITIC]
+You are a strict plan critic. Review this build plan and deliverables list.
+Look for: missing files, sections too large for one model generation, wrong
+build order, vague sections a builder could not execute, missing verification.
+Be concrete.
+
+<PLAN>
+$(printf '%s' "$PLAN_RAW" | perl -0777 -pe 's/<DELIVERABLES>.*?<\/DELIVERABLES>//s')
+</PLAN>
+
+DELIVERABLES:
+$(agent_deliv_status)
+$([ "$PROJECT" -eq 1 ] && printf 'SECTIONS:\n%s\n' "$(cat "$PROJ/.aicli/progress.md" 2>/dev/null)")
+
+Respond with EXACTLY one verdict block and nothing else:
+<VERDICT>{\"verdict\": \"approve\"}</VERDICT>
+or
+<VERDICT>{\"verdict\": \"revise\", \"notes\": \"concrete issues, e.g. 'styles.css is missing; split the hero section, it is too large'\"}</VERDICT>")" || CRIT_RAW=""
+            local cvjson verdict="approve" notes=""
+            cvjson="$(printf '%s' "$CRIT_RAW" | extract_verdict_json)"
+            if [ -n "$cvjson" ]; then
+                local -a CV=()
+                mapfile -d '' -t CV < <(printf '%s' "$cvjson" | parse_verdict)
+                verdict="${CV[0]:-approve}"
+                notes="${CV[1]:-}"
+            else
+                echo "AGENT: critic gave no verdict block; accepting plan with warning."
+            fi
+            if [ "$verdict" = "approve" ]; then
+                echo "AGENT: plan approved."
+                crit_done=1
+            elif [ "$verdict" = "revise" ] && [ -n "$notes" ]; then
+                echo "AGENT: plan needs revision: $notes"
+                echo "AGENT: loading $ARCH_M for plan revision..."
+                PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "$(agent_architect_prompt "REVISION REQUESTED - address every point below, then output the full revised <DELIVERABLES> and plan. Critic notes: $notes")")" || PLAN_RAW=""
+                if agent_parse_deliverables && [ "$PROJECT" -eq 1 ]; then
+                    project_progress_init
+                    echo "AGENT: project checklist rewritten to .aicli/progress.md"
+                fi
+            else
+                echo "AGENT: unclear critic verdict ('$verdict'); accepting plan."
+                crit_done=1
+            fi
+        done
+        [ "$crit_done" -eq 0 ] && echo "AGENT: plan critique rounds exhausted; proceeding with latest plan."
+    fi
+    local T_ARCH_END=$SECONDS
+
     local PLAN
     PLAN="$(printf '%s' "$PLAN_RAW" | perl -0777 -pe 's/<DELIVERABLES>.*?<\/DELIVERABLES>//s')"
     [ -z "$PLAN" ] && PLAN="$PLAN_RAW"
@@ -775,16 +901,44 @@ early done calls and lists what remains.
 SYS_EOF
 )"
     fi
+    if [ "$THOROUGH" -eq 1 ]; then
+        SYS+="$(cat <<'SYS_EOF'
+
+THOROUGH MODE - quality over speed, take as many steps as you need:
+- After every write/append, RE-READ the file and verify the section is complete
+  and correct before calling progress. Fix problems with more write/append
+  calls; only check off sections that are truly done.
+- Prefer small, correct steps over big leaps. If a run command fails, read the
+  error output, fix the cause, and re-run rather than moving on.
+- Before done, re-read each deliverable end to end and fix anything off.
+SYS_EOF
+)"
+    fi
 
     local _pmodesuffix=""
-    [ "$PROJECT" -eq 1 ] && _pmodesuffix=", project mode"
+    [ "$PROJECT" -eq 1 ] && _pmodesuffix+=", project mode"
+    [ "$THOROUGH" -eq 1 ] && _pmodesuffix+=", thorough"
     echo "AGENT phase 2/3: builder ($BUILD_M) working (mode=$MODE, max_steps=$MAX_STEPS$_pmodesuffix)..."
+
+    # ---- timing state ----
+    local -a STEP_TIMES=()   # "secs|step|tool|arg"
+    local -a SECT_TIMES=()   # "secs|path -- section"
+    declare -A SECT_START=() # "path::section" -> $SECONDS at first write
+    local T_BUILD_START=$SECONDS T_BUILD_END=0 T_REV_START=0 T_REV_END=0
 
     while [ "$finished" -eq 0 ]; do
         local done_flag=0
         while [ "$step" -lt "$MAX_STEPS" ] && [ "$done_flag" -eq 0 ]; do
             step=$((step + 1))
-            echo "--- step $step/$MAX_STEPS ---"
+            local _secinfo=""
+            if [ "$PROJECT" -eq 1 ] && [ -f "$PROJ/.aicli/progress.md" ]; then
+                local _t _d
+                _t="$(grep -cE '^\s*- \[[ x]\]' "$PROJ/.aicli/progress.md" 2>/dev/null)"; _t="${_t:-0}"
+                _d="$(grep -cE '^\s*- \[x\]' "$PROJ/.aicli/progress.md" 2>/dev/null)"; _d="${_d:-0}"
+                _secinfo=" [sections $_d/$_t]"
+            fi
+            echo "--- step $step/$MAX_STEPS$_secinfo ---"
+            local _step_start=$SECONDS
             local response="" tool_json="" tool="(none)" a1="" a2=""
             response="$(timeout "$MODEL_TIMEOUT" ollama run "$BUILD_M" <<< "$(agent_render_prompt "$tool_result")")" || response=""
 
@@ -857,6 +1011,10 @@ SYS_EOF
                                 printf '%s\n' "$a2" > "$PROJ/$sp"
                                 CHANGED+=("$sp")
                                 [ "$PROJECT" -eq 0 ] && agent_mark_done "$sp"
+                                if [ "$PROJECT" -eq 1 ]; then
+                                    _sect_stamp_key="$sp::$(project_first_open_section "$sp")"
+                                    [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
+                                fi
                                 tool_result="wrote $sp"
                             fi
                         else
@@ -882,6 +1040,10 @@ SYS_EOF
                             else
                                 printf '%s\n' "$a2" >> "$PROJ/$sp"
                                 case " ${CHANGED[*]} " in *" $sp "*) ;; *) CHANGED+=("$sp");; esac
+                                if [ "$PROJECT" -eq 1 ]; then
+                                    _sect_stamp_key="$sp::$(project_first_open_section "$sp")"
+                                    [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
+                                fi
                                 tool_result="appended ${#a2} chars to $sp"
                             fi
                         else
@@ -893,6 +1055,20 @@ SYS_EOF
                             pm_out="$(project_progress_mark "$sp" "$a2" 2>&1)"
                             pm_rc=$?
                             tool_result="$pm_out"
+                            if [ "$pm_rc" -eq 0 ]; then
+                                _sect_key="" _sect_label=""
+                                if [[ "$pm_out" =~ ^checked\ off:\ (.+)\ --\ (.+)$ ]]; then
+                                    _sect_key="${BASH_REMATCH[1]}::${BASH_REMATCH[2]}"
+                                    _sect_label="${BASH_REMATCH[1]} -- ${BASH_REMATCH[2]}"
+                                elif [[ "$pm_out" =~ ^checked\ off:\ (.+)\ \(all\ sections\ done\)$ ]]; then
+                                    _sect_key="${BASH_REMATCH[1]}::"
+                                    _sect_label="${BASH_REMATCH[1]}"
+                                fi
+                                if [ -n "$_sect_key" ] && [ -n "${SECT_START[$_sect_key]+x}" ]; then
+                                    SECT_TIMES+=("$((SECONDS - SECT_START[$_sect_key]))|$_sect_label")
+                                    unset 'SECT_START[$_sect_key]'
+                                fi
+                            fi
                             if [ "$pm_rc" -eq 0 ] && grep -qF -- "- [x] $sp --" "$PROJ/.aicli/progress.md" 2>/dev/null; then
                                 agent_mark_done "$sp"
                             fi
@@ -943,6 +1119,9 @@ SYS_EOF
             fi
 
             HIST+=("tool: $tool ${a1:0:60} => $(printf '%s' "$tool_result" | head -n 1 | head -c 120)")
+            _step_dur=$((SECONDS - _step_start))
+            STEP_TIMES+=("$_step_dur|$step|$tool|${a1:0:50}")
+            echo "  [step $step took ${_step_dur}s]"
         done
 
         if [ "$step" -ge "$MAX_STEPS" ] && [ "$done_flag" -eq 0 ]; then
@@ -960,6 +1139,7 @@ SYS_EOF
         prev_sig="$cur_sig"
 
         # ---- Phase 3: reviewer ----
+        T_BUILD_END=$SECONDS
         if [ "$DO_REVIEW" -eq 0 ] || [ "$finished" -eq 1 ]; then
             finished=1
             break
@@ -996,6 +1176,7 @@ $(agent_deliv_status)"
         done
 
         local vresp vjson verdict="approve" notes=""
+        [ "$T_REV_START" -eq 0 ] && T_REV_START=$SECONDS
         vresp="$(timeout "$MODEL_TIMEOUT" ollama run "$REV_M" <<< "$REV_PROMPT")" || vresp=""
         vjson="$(printf '%s' "$vresp" | extract_verdict_json)"
         if [ -n "$vjson" ]; then
@@ -1018,6 +1199,7 @@ $(agent_deliv_status)"
             echo "AGENT: unclear reviewer verdict ('$verdict'); accepting."
             finished=1
         fi
+        T_REV_END=$SECONDS
     done
 
     local missing_count
@@ -1028,6 +1210,51 @@ $(agent_deliv_status)"
     fi
     echo
     echo "AGENT: run complete ($step steps, ${#CHANGED[@]} files changed, $missing_count deliverables missing)."
+    agent_print_timing
+}
+
+# Timing report: per phase, per section, slowest steps. Durations in seconds.
+agent_print_timing() {
+    local fmt_dur
+    fmt_dur() {
+        if [ "$1" -ge 60 ]; then
+            printf '%dm%02ds' "$(( $1 / 60 ))" "$(( $1 % 60 ))"
+        else
+            printf '%ss' "$1"
+        fi
+    }
+    local d_arch=$((T_ARCH_END - T_ARCH_START))
+    [ "$d_arch" -lt 0 ] && d_arch=0
+    local d_build=$((T_BUILD_END - T_BUILD_START))
+    [ "$d_build" -lt 0 ] && d_build=0
+    local d_rev=0
+    [ "$T_REV_END" -gt "$T_REV_START" ] && d_rev=$((T_REV_END - T_REV_START))
+    local d_total=$((d_arch + d_build + d_rev))
+    echo "AGENT timing:"
+    local _critinfo=""
+    [ "$PLAN_CRIT_ROUNDS" -gt 0 ] && _critinfo=" ($PLAN_CRIT_ROUNDS critique rounds)"
+    echo "  architect: $(fmt_dur "$d_arch")$_critinfo"
+    echo "  builder: $(fmt_dur "$d_build") over $step steps"
+    echo "  reviewer: $(fmt_dur "$d_rev")"
+    echo "  total: $(fmt_dur "$d_total")"
+    if [ "${#SECT_TIMES[@]}" -gt 0 ]; then
+        echo "  per section (slowest first):"
+        printf '%s\n' "${SECT_TIMES[@]}" | sort -t'|' -k1,1nr | while IFS='|' read -r s label; do
+            echo "    $label: $(fmt_dur "$s")"
+        done
+    fi
+    if [ "${#STEP_TIMES[@]}" -gt 0 ]; then
+        echo "  slowest steps:"
+        printf '%s\n' "${STEP_TIMES[@]}" | sort -t'|' -k1,1nr | head -3 | while IFS='|' read -r s n t a; do
+            echo "    step $n: $t ${a:+\"$a\"}: $(fmt_dur "$s")"
+        done
+    fi
+    if [ "$d_total" -gt 0 ]; then
+        local _slow="architect" _slowd="$d_arch"
+        [ "$d_build" -gt "$_slowd" ] && { _slow="builder"; _slowd="$d_build"; }
+        [ "$d_rev" -gt "$_slowd" ] && { _slow="reviewer"; _slowd="$d_rev"; }
+        echo "  slowest phase: $_slow ($(( _slowd * 100 / d_total ))%)"
+    fi
 }
 
 # aicli agent --chat ["initial message"]

@@ -306,6 +306,40 @@ Because the checklist lives on disk rather than in context, the model can't lose
 place on long builds — this is the mechanism that lets a 14B model reliably finish
 work that used to stall, loop, or end in placeholders.
 
+#### Thorough mode: `aagent --project --thorough`
+
+When quality matters more than speed, `--thorough` gives both the architect and the
+builder more power — expect a run to take several times longer:
+
+```bash
+aagent --project --thorough "Build a blog with index, archive, and post pages plus shared CSS"
+```
+
+- **Architect plans against reality.** The architect prompt now always includes a
+  project snapshot (files, 2 levels deep), so the plan accounts for what already
+  exists instead of planning blind.
+- **Plan critique loop.** After the architect drafts the plan, a critic
+  (the reviewer model, or the architect itself under `--no-review`) reviews it for
+  missing files, oversized sections, and wrong build order. `revise` verdicts send
+  the architect back with concrete notes; `approve` starts the build. Up to 3 rounds.
+- **Builder verifies per section.** The builder is instructed to re-read each file
+  after every `write`/`append` and only check off sections that are truly done,
+  fixing problems before moving on.
+- **Higher caps.** `--max-steps` defaults to 80 and `--max-revisions` to 5 under
+  `--thorough` (both still overridable).
+
+**Visibility.** Every run now mirrors its full output to
+`.aicli/run-<timestamp>-<pid>.log`, so you can `tail -f` progress from another
+terminal or review a finished run. Step lines show live checklist progress
+(`--- step 12/80 [sections 4/9] ---`), per-step durations, and a `loading ... (first
+load from disk can take a minute)` note before the first model call so a cold start
+doesn't look hung.
+
+**Timing report.** Each run ends with `AGENT timing:` — per-phase durations
+(architect with critique-round count, builder with step count, reviewer), per-section
+durations slowest-first, the 3 slowest steps, and a `slowest phase: X (N%)` line so
+you can see where the time actually goes and what to optimize next.
+
 **Model size matters more than anything else here.** A 7B coder model can run the agent
 loop, but it will need the guardrails above to finish real tasks. For noticeably better
 agency, give the architect and reviewer a larger reasoning model and keep a fast coder
