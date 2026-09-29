@@ -433,6 +433,7 @@ cmd_agent() {
     local -a DELIV_PATHS=() DELIV_PURPOSE=() DELIV_DONE=() DELIV_SECS=()
     local step=0 rev=0 finished=0 notool_streak=0 done_reject_streak=0
     local LAST_WHASH="" SAME_WRITE_COUNT=0
+    local CHURN_FILE="" CHURN_N=0
     local tool_result="" prev_sig=""
 
     while [ $# -gt 0 ]; do
@@ -1112,7 +1113,20 @@ SYS_EOF
                                 if [ "$PROJECT" -eq 1 ]; then
                                     _open="$(project_open_sections "$sp")"
                                     if [ -n "$_open" ]; then
-                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Check off each finished section with the progress tool (one call per section; 'progress $sp' checks the next open one)."
+                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Add the next section with APPEND (do not rewrite the whole file), then check it off with the progress tool (one call per section; 'progress $sp' checks the next open one)."
+                                    fi
+                                    # v2.9.5: rewrite-churn breaker. Rewriting the same file
+                                    # repeatedly without checking off a section is a churn
+                                    # loop (model regenerates skeletons instead of building
+                                    # incrementally). Redirect it to append + progress.
+                                    if [ "$sp" = "$CHURN_FILE" ]; then
+                                        CHURN_N=$((CHURN_N + 1))
+                                    else
+                                        CHURN_FILE="$sp"; CHURN_N=1
+                                    fi
+                                    if [ "$CHURN_N" -ge 4 ]; then
+                                        tool_result+="${NL}CHURN WARNING: you have rewritten '$sp' $CHURN_N times without checking off any section. STOP rewriting the whole file. Use APPEND to add the next section with real content, then call progress."
+                                        CHURN_N=0
                                     fi
                                 fi
                             fi
@@ -1144,6 +1158,7 @@ SYS_EOF
                                     [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
                                 fi
                                 tool_result="appended ${#a2} chars to $sp"
+                                CHURN_FILE=""; CHURN_N=0
                             fi
                         else
                             tool_result="ERROR: path rejected (must be relative, no ..): $a1"
@@ -1175,6 +1190,7 @@ SYS_EOF
                             # so checking sections one by one never trips the circuit breaker.
                             if [[ "$pm_out" == "checked off:"* ]]; then
                                 REPEAT_SIG=""; REPEAT_N=0
+                                CHURN_FILE=""; CHURN_N=0
                             fi
                             # v1.5.3: all sections checked -> finish the builder right away.
                             # The model reliably drives progress to N/N but never calls done;
