@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.9.3 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.3)"
+VERSION="2.9.4 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.4)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -604,20 +604,37 @@ while j < len(lines) and lines[j].startswith('  - ['):
     if m:
         secs.append(j)
     j += 1
+# v1.5.4: forgiving section resolution. An empty section, or the file's own
+# "-- label" (which models mistake for a section name), means "the next open
+# section" instead of an error.
+mfl = re.match(r'- \[[ x]\] \S+\s*--\s*(.*)', lines[fi])
+file_label = mfl.group(1).strip() if mfl else ''
+def _is_bare():
+    return (not target_sec.strip()) or (file_label and norm(target_sec) == norm(file_label))
 if not secs:
-    if target_sec.strip():
+    if not _is_bare():
         print("ERROR: '%s' has no sections; call progress with an empty section." % target_path)
         sys.exit(2)
     lines[fi] = lines[fi].replace('- [ ]', '- [x]', 1)
-    open(pf, 'w').write('\n'.join(lines))
+    open(pf,'w').write('\n'.join(lines))
     print("checked off: %s (all sections done)" % target_path)
     sys.exit(0)
 hit = None
-for idx in secs:
-    name = re.match(r'  - \[[ x]\] (.*)', lines[idx]).group(1)
-    if norm(name) == norm(target_sec):
-        hit = (idx, name)
-        break
+if _is_bare():
+    for idx in secs:
+        m2 = re.match(r'  - \[ \] (.*)', lines[idx])
+        if m2:
+            hit = (idx, m2.group(1))
+            break
+    if hit is None:
+        print("all sections already checked for %s" % target_path)
+        sys.exit(0)
+else:
+    for idx in secs:
+        name = re.match(r'  - \[[ x]\] (.*)', lines[idx]).group(1)
+        if norm(name) == norm(target_sec):
+            hit = (idx, name)
+            break
 if hit is None:
     valid = ", ".join(re.match(r'  - \[[ x]\] (.*)', lines[i]).group(1) for i in secs)
     print("ERROR: no section '%s' under %s. Valid sections: %s" % (target_sec, target_path, valid))
@@ -1019,8 +1036,13 @@ SYS_EOF
                 # exempt - rejected dones have their own streak counter;
                 # write/append are exempt - identical rewrites have their own
                 # content-hash detector with a more specific message).
-                local _sig="$tool|$a1" _skip_dispatch=0
-                if [ "$tool" != "done" ] && [ "$tool" != "write" ] && [ "$tool" != "append" ]; then
+                local _sig="$tool|$a1|$a2" _skip_dispatch=0
+                if [ "$tool" = "write" ] || [ "$tool" = "append" ] || [ "$tool" = "done" ]; then
+                    # v1.5.4: real work (or a finish attempt) breaks any repeat streak.
+                    # Previously write/append neither counted nor reset, so a
+                    # write->progress(error) cycle looked like "6 in a row".
+                    REPEAT_SIG=""; REPEAT_N=0
+                else
                     if [ "$_sig" = "$REPEAT_SIG" ]; then
                         REPEAT_N=$((REPEAT_N + 1))
                     else
@@ -1090,7 +1112,7 @@ SYS_EOF
                                 if [ "$PROJECT" -eq 1 ]; then
                                     _open="$(project_open_sections "$sp")"
                                     if [ -n "$_open" ]; then
-                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Call the progress tool now to check off every section you just finished writing."
+                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Check off each finished section with the progress tool (one call per section; 'progress $sp' checks the next open one)."
                                     fi
                                 fi
                             fi
@@ -1122,12 +1144,6 @@ SYS_EOF
                                     [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
                                 fi
                                 tool_result="appended ${#a2} chars to $sp"
-                                if [ "$PROJECT" -eq 1 ]; then
-                                    _open="$(project_open_sections "$sp")"
-                                    if [ -n "$_open" ]; then
-                                        tool_result+="${NL}PROJECT: '$sp' still has unchecked sections:${NL}${_open}${NL}Call the progress tool now to check off every section you just finished writing."
-                                    fi
-                                fi
                             fi
                         else
                             tool_result="ERROR: path rejected (must be relative, no ..): $a1"
@@ -1154,6 +1170,11 @@ SYS_EOF
                             fi
                             if [ "$pm_rc" -eq 0 ] && grep -qF -- "- [x] $sp --" "$PROJ/.aicli/progress.md" 2>/dev/null; then
                                 agent_mark_done "$sp"
+                            fi
+                            # v1.5.4: a check-off that made progress breaks the repeat streak,
+                            # so checking sections one by one never trips the circuit breaker.
+                            if [[ "$pm_out" == "checked off:"* ]]; then
+                                REPEAT_SIG=""; REPEAT_N=0
                             fi
                             # v1.5.3: all sections checked -> finish the builder right away.
                             # The model reliably drives progress to N/N but never calls done;
