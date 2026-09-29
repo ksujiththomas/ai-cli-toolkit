@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.7.1 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.3.1)"
+VERSION="2.7.2 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.3.2)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -103,7 +103,7 @@ esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.7.1 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.7.2 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -989,7 +989,11 @@ SYS_EOF
                 printf '  [%s %s]\n' "$tool" "$(printf '%s' "$a1" | head -c 60)"
                 chat_exec_tool "$tool" "$a1" "$a2"
                 printf '  -> %s\n' "$(printf '%s' "$TOOL_RESULT" | head -n 1 | head -c 120)"
-                results_text+="${NL}- $tool $a1 => $(printf '%s' "$TOOL_RESULT" | head -n 1 | head -c 300)"
+                # Feed the model a real chunk of the result (not just the first
+                # line) - otherwise `read` on a multi-line file is useless and
+                # the model loops re-reading. TOOL_RESULT is already capped at
+                # OUT_CHARS by chat_exec_tool.
+                results_text+="${NL}- $tool $a1 => $(printf '%s' "$TOOL_RESULT" | head -c 2000)"
                 HIST+=("Muse [tool]: $tool ${a1:0:60}")
             done < <(printf '%s' "$blocks")
             latest="${results_text}${NL}Continue: if the work is done, reply with a short summary and no tool blocks."
