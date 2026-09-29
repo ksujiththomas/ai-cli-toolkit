@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.9.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.0)"
+VERSION="2.9.1 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.1)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -778,11 +778,28 @@ AP_EOF
         echo "AGENT phase 1/3: architect ($ARCH_M) planning..."
     fi
     echo "AGENT: loading $ARCH_M (first load from disk can take a minute)..."
-    local PLAN_RAW
-    PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "$(agent_architect_prompt)")" || PLAN_RAW=""
+    local PLAN_RAW="" _arch_try=0 _arch_ok=0
+    while [ "$_arch_try" -lt 3 ] && [ "$_arch_ok" -eq 0 ]; do
+        _arch_try=$((_arch_try + 1))
+        local _arch_extra=""
+        if [ "$_arch_try" -gt 1 ]; then
+            echo "AGENT: retrying architect (attempt $_arch_try/3)..."
+            _arch_extra="Your previous reply had no parseable <DELIVERABLES> block. Put the <DELIVERABLES> JSON array FIRST, exactly in the format shown above, then the plan."
+        fi
+        PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "$(agent_architect_prompt "$_arch_extra")")" || PLAN_RAW=""
+        if agent_parse_deliverables; then
+            _arch_ok=1
+        elif [ -z "$PLAN_RAW" ]; then
+            echo "AGENT: architect attempt $_arch_try returned empty output." >&2
+        else
+            local _rawf="$PROJ/.aicli/architect-attempt-$_arch_try.raw"
+            printf '%s' "$PLAN_RAW" > "$_rawf"
+            echo "AGENT: architect attempt $_arch_try produced no parseable deliverables; raw output saved to $_rawf" >&2
+        fi
+    done
 
-    if ! agent_parse_deliverables; then
-        echo "AGENT warning: architect produced no usable deliverables list; the done-gate is disabled for this run." >&2
+    if [ "$_arch_ok" -eq 0 ]; then
+        echo "AGENT warning: architect produced no usable deliverables list after 3 attempts; the done-gate is disabled for this run." >&2
         PROJECT=0  # fall back to plain mode; nothing to track sections against
     elif [ "$PROJECT" -eq 1 ]; then
         project_progress_init
@@ -925,6 +942,8 @@ SYS_EOF
     local -a SECT_TIMES=()   # "secs|path -- section"
     declare -A SECT_START=() # "path::section" -> $SECONDS at first write
     local T_BUILD_START=$SECONDS T_BUILD_END=0 T_REV_START=0 T_REV_END=0
+    # ---- repeat-call circuit breaker ----
+    local REPEAT_SIG="" REPEAT_N=0
 
     while [ "$finished" -eq 0 ]; do
         local done_flag=0
@@ -966,6 +985,29 @@ SYS_EOF
                 a2="${F[2]:-}"
                 local sp="" out="" rc=0
                 printf '  > %s %s\n' "$tool" "$(printf '%s' "$a1" | head -c 80)"
+                # Repeat-call circuit breaker: the same tool with the same first
+                # argument 3x in a row means the model is looping ('done' is
+                # exempt - rejected dones have their own streak counter;
+                # write/append are exempt - identical rewrites have their own
+                # content-hash detector with a more specific message).
+                local _sig="$tool|$a1" _skip_dispatch=0
+                if [ "$tool" != "done" ] && [ "$tool" != "write" ] && [ "$tool" != "append" ]; then
+                    if [ "$_sig" = "$REPEAT_SIG" ]; then
+                        REPEAT_N=$((REPEAT_N + 1))
+                    else
+                        REPEAT_SIG="$_sig"; REPEAT_N=0
+                    fi
+                    if [ "$REPEAT_N" -ge 5 ]; then
+                        echo "AGENT: '$tool ${a1:0:60}' repeated 6 times with no progress - aborting run." >&2
+                        echo "AGENT: tip: agent mode works much better with a larger model (e.g. qwen2.5-coder:14b or 32b)." >&2
+                        finished=1
+                        break
+                    elif [ "$REPEAT_N" -ge 2 ]; then
+                        tool_result="LOOP WARNING: you have called '$tool' with these same arguments $((REPEAT_N + 1)) times in a row and made no progress. Do NOT call it again. Look at the deliverables / PROGRESS checklist and do the next piece of actual work."
+                        _skip_dispatch=1
+                    fi
+                fi
+                if [ "$_skip_dispatch" -eq 0 ]; then
                 case "$tool" in
                     '!parse-error')
                         tool_result="That was not valid JSON, and no JSON object could be recovered from it. Emit clean JSON inside the <TOOL> block." ;;
@@ -1113,6 +1155,7 @@ SYS_EOF
                     *)
                         tool_result="ERROR: unknown tool '$tool'. Available: read, write, append, ls, run, progress, done." ;;
                 esac
+                fi # _skip_dispatch: loop-warning replaces the tool result
                 # Cap giant outputs so history can't blow the context window.
                 tool_result="$(printf '%s' "$tool_result" | head -c "$OUT_CHARS")"
                 printf '  < %s\n' "$(printf '%s' "$tool_result" | head -n 1 | head -c 160)"

@@ -335,6 +335,17 @@ terminal or review a finished run. Step lines show live checklist progress
 load from disk can take a minute)` note before the first model call so a cold start
 doesn't look hung.
 
+**Hardening.** Two circuit breakers cover the ways a weak model actually dies:
+
+- **Architect retry.** If the architect returns no parseable `<DELIVERABLES>` block,
+  the harness retries up to 3 times (with a stricter format reminder), instead of
+  silently disabling the done-gate and letting the builder flail without a plan. Raw
+  architect output is saved to `.aicli/architect-attempt-N.raw` for forensics.
+- **Repeat-call breaker.** The same tool with the same arguments 3× in a row (e.g.
+  17× `ls .`) gets a `LOOP WARNING` redirect instead of executing; 6× aborts the run.
+  `done` and `write`/`append` are exempt — rejected dones and identical rewrites have
+  their own dedicated detectors.
+
 **Timing report.** Each run ends with `AGENT timing:` — per-phase durations
 (architect with critique-round count, builder with step count, reviewer), per-section
 durations slowest-first, the 3 slowest steps, and a `slowest phase: X (N%)` line so
