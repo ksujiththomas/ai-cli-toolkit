@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.7.2 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.3.2)"
+VERSION="2.8.0 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.4.0)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -103,7 +103,7 @@ esac
 
 show_help() {
     cat << 'HELP'
-aicli v2.7.2 - Unified Local AI CLI Toolkit powered by Ollama
+aicli v2.8.0 - Unified Local AI CLI Toolkit powered by Ollama
 
 USAGE:
     aicli <subcommand> [options] "your prompt or request"
@@ -223,10 +223,14 @@ tool = str(d.get("tool", ""))
 a1 = a2 = ""
 if tool in ("read", "ls"):
     a1 = str(d.get("path", ""))
-elif tool == "write":
+elif tool in ("write", "append"):
     a1 = str(d.get("path", ""))
     a2 = str(d.get("content", ""))
+elif tool == "progress":
+    a1 = str(d.get("path", ""))
+    a2 = str(d.get("section", ""))
 elif tool == "run":
+    a1 = str(d.get("command", ""))
     a1 = str(d.get("command", ""))
 elif tool == "remember":
     a1 = str(d.get("scope", "project"))
@@ -251,7 +255,8 @@ sys.stdout.write(str(d.get("verdict", "")) + "\x00" + str(d.get("notes", "")))
 }
 
 # Parse the architect's <DELIVERABLES> JSON array from stdin.
-# Prints "path|purpose" lines. Exit 1 = no block, 2 = invalid JSON.
+# Prints "path|purpose|sec1;sec2;sec3" lines (sections may be empty).
+# Exit 1 = no block, 2 = invalid JSON.
 parse_deliverables() {
     python3 -c '
 import sys, json, re
@@ -263,12 +268,18 @@ try:
     items = json.loads(m.group(1))
 except Exception:
     sys.exit(2)
+def clean(s):
+    return re.sub(r"[|;]", "", str(s)).strip()
 for it in items:
     if not isinstance(it, dict):
         continue
-    p = str(it.get("path", "")).strip()
-    if p:
-        print(p + "|" + str(it.get("purpose", "")).strip())
+    p = clean(it.get("path", ""))
+    if not p:
+        continue
+    purpose = clean(it.get("purpose", ""))
+    secs = it.get("sections", []) or []
+    sec_str = ";".join(clean(s) for s in secs if clean(s))
+    print(p + "|" + purpose + "|" + sec_str)
 '
 }
 
@@ -366,6 +377,19 @@ chat_exec_tool() {
             else
                 TOOL_RESULT="ERROR: path rejected (must be relative, no ..): $a1"
             fi ;;
+        append)
+            if sp="$(sanitize_relpath "$a1")"; then
+                if [ "$MODE" = "dry-run" ]; then
+                    TOOL_RESULT="dry-run: would append ${#a2} chars to: $sp (not executed)"
+                elif [ ! -f "$PROJ/$sp" ]; then
+                    TOOL_RESULT="ERROR: cannot append to $sp: file does not exist yet. Use write first."
+                else
+                    printf '%s\n' "$a2" >> "$PROJ/$sp"
+                    TOOL_RESULT="appended ${#a2} chars to $sp"
+                fi
+            else
+                TOOL_RESULT="ERROR: path rejected (must be relative, no ..): $a1"
+            fi ;;
         run)
             if agent_cmd_denied "$a1"; then
                 TOOL_RESULT="ERROR: command denied by safety policy."
@@ -390,7 +414,7 @@ chat_exec_tool() {
                 TOOL_RESULT="remembered ($scope): $a2"
             fi ;;
         *)
-            TOOL_RESULT="ERROR: unknown tool '$tool'. Available: read, write, ls, run, remember." ;;
+            TOOL_RESULT="ERROR: unknown tool '$tool'. Available: read, write, append, ls, run, remember." ;;
     esac
     TOOL_RESULT="$(printf '%s' "$TOOL_RESULT" | head -c "$OUT_CHARS")"
 }
@@ -402,11 +426,11 @@ cmd_agent() {
     local OUT_CHARS="$AGENT_MAX_OUTPUT_CHARS" MODEL_TIMEOUT="$AGENT_MODEL_TIMEOUT"
     local HIST_KEPT="$AGENT_HISTORY_KEPT"
     local DO_REVIEW=1
-    local CHAT=0 MAX_STEPS_SET=0
+    local CHAT=0 MAX_STEPS_SET=0 PROJECT=0
     local NL=$'\n'
 
     local -a CHANGED=() HIST=()
-    local -a DELIV_PATHS=() DELIV_PURPOSE=() DELIV_DONE=()
+    local -a DELIV_PATHS=() DELIV_PURPOSE=() DELIV_DONE=() DELIV_SECS=()
     local step=0 rev=0 finished=0 notool_streak=0 done_reject_streak=0
     local LAST_WHASH="" SAME_WRITE_COUNT=0
     local tool_result="" prev_sig=""
@@ -432,6 +456,7 @@ cmd_agent() {
                 [ $# -ge 2 ] || { echo "Flag --max-revisions needs a value." >&2; return 1; }
                 MAX_REV="$2"; shift 2 ;;
             --no-review) DO_REVIEW=0; shift ;;
+            --project) PROJECT=1; shift ;;
             --chat) CHAT=1; shift ;;
             --) shift; break ;;
             -*) echo "Unknown agent flag: $1" >&2; return 1 ;;
@@ -451,7 +476,8 @@ cmd_agent() {
         echo "Usage: aicli agent [flags] \"task description\"" >&2
         echo "Flags: --architect-model M --builder-model M --reviewer-model M" >&2
         echo "       --mode sandbox|confirm|dry-run" >&2
-        echo "       --max-steps N --max-revisions N --no-review --chat" >&2
+        echo "       --max-steps N --max-revisions N --no-review --project --chat" >&2
+        echo "       --project: section-by-section build with a progress checklist" >&2
         return 1
     fi
 
@@ -461,6 +487,9 @@ cmd_agent() {
     esac
     [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "Error: --max-steps must be a positive integer." >&2; return 1; }
     [[ "$MAX_REV" =~ ^[0-9]+$ ]] || { echo "Error: --max-revisions must be a non-negative integer." >&2; return 1; }
+    if [ "$PROJECT" -eq 1 ] && [ "$MAX_STEPS_SET" -eq 0 ]; then
+        MAX_STEPS=40  # section-by-section builds need more steps
+    fi
 
     local m
     for m in "$ARCH_M" "$BUILD_M"; do
@@ -515,6 +544,88 @@ cmd_agent() {
             fi
         done
     }
+    # ---- Project mode: .aicli/progress.md is the harness-owned checklist ----
+    # The architect breaks each deliverable into sections; the builder checks
+    # them off with the `progress` tool. The done-gate reads this file, so a
+    # model cannot fake completion by vibes.
+    project_progress_init() {
+        local pf="$PROJ/.aicli/progress.md"
+        mkdir -p "$PROJ/.aicli"
+        {
+            printf '# Build progress\n'
+            printf '# Updated via the `progress` tool. Do not edit by hand.\n'
+            local i s
+            for i in "${!DELIV_PATHS[@]}"; do
+                printf -- '- [ ] %s -- %s\n' "${DELIV_PATHS[$i]}" "${DELIV_PURPOSE[$i]}"
+                local IFS=';'
+                for s in ${DELIV_SECS[$i]}; do
+                    [ -n "$s" ] && printf -- '  - [ ] %s\n' "$s"
+                done
+                unset IFS
+            done
+        } > "$pf"
+    }
+    # Mark a section done. Prints the result; exit 0 = marked, 2 = no match.
+    # On success also checks the file box when its last section completes.
+    project_progress_mark() {
+        local path="$1" section="$2"
+        python3 - "$PROJ/.aicli/progress.md" "$path" "$section" <<'PYEOF'
+import sys, re
+pf, target_path, target_sec = sys.argv[1], sys.argv[2], sys.argv[3]
+def norm(s):
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+lines = open(pf).read().split('\n')
+fi = None
+for i, ln in enumerate(lines):
+    m = re.match(r'- \[[ x]\] (\S+)\s*--', ln)
+    if m and norm(m.group(1)) == norm(target_path):
+        fi = i
+        break
+if fi is None:
+    print("ERROR: '%s' is not in the progress file." % target_path)
+    sys.exit(2)
+secs = []
+j = fi + 1
+while j < len(lines) and lines[j].startswith('  - ['):
+    m = re.match(r'  - \[[ x]\] (.*)', lines[j])
+    if m:
+        secs.append(j)
+    j += 1
+if not secs:
+    if target_sec.strip():
+        print("ERROR: '%s' has no sections; call progress with an empty section." % target_path)
+        sys.exit(2)
+    lines[fi] = lines[fi].replace('- [ ]', '- [x]', 1)
+    open(pf, 'w').write('\n'.join(lines))
+    print("checked off: %s (all sections done)" % target_path)
+    sys.exit(0)
+hit = None
+for idx in secs:
+    name = re.match(r'  - \[[ x]\] (.*)', lines[idx]).group(1)
+    if norm(name) == norm(target_sec):
+        hit = (idx, name)
+        break
+if hit is None:
+    valid = ", ".join(re.match(r'  - \[[ x]\] (.*)', lines[i]).group(1) for i in secs)
+    print("ERROR: no section '%s' under %s. Valid sections: %s" % (target_sec, target_path, valid))
+    sys.exit(2)
+idx, name = hit
+if lines[idx].startswith('  - [x]'):
+    print("NOTE: section '%s' was already checked off." % name)
+else:
+    lines[idx] = lines[idx].replace('- [ ]', '- [x]', 1)
+    print("checked off: %s -- %s" % (target_path, name))
+if all(lines[i].startswith('  - [x]') for i in secs):
+    lines[fi] = lines[fi].replace('- [ ]', '- [x]', 1)
+open(pf, 'w').write('\n'.join(lines))
+PYEOF
+    }
+    # Print unchecked "path -- section" lines, for the done-gate message.
+    project_unchecked() {
+        local pf="$PROJ/.aicli/progress.md"
+        [ -f "$pf" ] || return 0
+        grep -E '^\s*- \[ \]' "$pf" | sed -E 's/^\s*- \[ \] //'
+    }
     agent_render_history() {
         local n=${#HIST[@]} start=0 i
         if [ "$n" -gt "$HIST_KEPT" ]; then start=$((n - HIST_KEPT)); fi
@@ -526,7 +637,11 @@ cmd_agent() {
         # $1 = last tool result (may be empty)
         local p="$SYS"
         p+="${NL}${NL}TASK: ${TASK}"
-        p+="${NL}${NL}DELIVERABLES (create every MISSING one):${NL}$(agent_deliv_status)"
+        if [ "$PROJECT" -eq 1 ]; then
+            p+="${NL}${NL}PROGRESS (check sections off with the progress tool, top to bottom):${NL}$(cat "$PROJ/.aicli/progress.md" 2>/dev/null)"
+        else
+            p+="${NL}${NL}DELIVERABLES (create every MISSING one):${NL}$(agent_deliv_status)"
+        fi
         p+="${NL}${NL}PLAN:${NL}${PLAN}"
         p+="${NL}${NL}RECENT HISTORY (most recent last):${NL}$(agent_render_history)"
         if [ -n "$1" ]; then
@@ -548,9 +663,28 @@ cmd_agent() {
     }
 
     # ---- Phase 1: architect plans + deliverables ----
-    echo "AGENT phase 1/3: architect ($ARCH_M) planning..."
+    if [ "$PROJECT" -eq 1 ]; then
+        echo "AGENT phase 1/3: architect ($ARCH_M) planning (project mode: sections)..."
+    else
+        echo "AGENT phase 1/3: architect ($ARCH_M) planning..."
+    fi
     local PLAN_RAW
-    PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "[ROLE:ARCHITECT]
+    if [ "$PROJECT" -eq 1 ]; then
+        PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "[ROLE:ARCHITECT]
+You are a software architect. Your reply has TWO parts.
+
+PART 1 - deliverables. List every file this task requires (new files to create
+and existing files to modify) as a JSON array inside <DELIVERABLES> tags.
+Paths are relative to the project root, never absolute, never containing '..'.
+Break EVERY file into 2-5 concrete build sections, in the order they should be
+written. Example:
+<DELIVERABLES>[{\"path\": \"index.html\", \"purpose\": \"page structure\", \"sections\": [\"head and navigation\", \"hero section\", \"main content\", \"footer\"]}, {\"path\": \"styles.css\", \"purpose\": \"styling\", \"sections\": [\"base layout\", \"components\"]}]</DELIVERABLES>
+
+PART 2 - plan. After the tags, a short numbered plan (5-10 concrete steps).
+
+Task: $TASK")" || PLAN_RAW=""
+    else
+        PLAN_RAW="$(timeout "$MODEL_TIMEOUT" ollama run "$ARCH_M" <<< "[ROLE:ARCHITECT]
 You are a software architect. Your reply has TWO parts.
 
 PART 1 - deliverables. List every file this task requires (new files to create
@@ -562,18 +696,23 @@ Example:
 PART 2 - plan. After the tags, a short numbered plan (5-10 concrete steps).
 
 Task: $TASK")" || PLAN_RAW=""
+    fi
 
     if [ -n "$PLAN_RAW" ]; then
         local DLV_RAW
         if DLV_RAW="$(printf '%s' "$PLAN_RAW" | parse_deliverables)"; then
             local -a DLV=()
             mapfile -t DLV <<< "$DLV_RAW"
-            local dl dp
+            local dl dp rest rest2
             for dl in "${DLV[@]}"; do
                 dp="${dl%%|*}"
+                rest="${dl#*|}"
                 if dp="$(sanitize_relpath "$dp")"; then
                     DELIV_PATHS+=("$dp")
-                    DELIV_PURPOSE+=("${dl#*|}")
+                    DELIV_PURPOSE+=("${rest%%|*}")
+                    rest2="${rest#*|}"
+                    [ "$rest2" = "$rest" ] && rest2=""
+                    DELIV_SECS+=("$rest2")
                     DELIV_DONE+=(0)
                 fi
             done
@@ -581,6 +720,10 @@ Task: $TASK")" || PLAN_RAW=""
     fi
     if [ "${#DELIV_PATHS[@]}" -eq 0 ]; then
         echo "AGENT warning: architect produced no usable deliverables list; the done-gate is disabled for this run." >&2
+        PROJECT=0  # fall back to plain mode; nothing to track sections against
+    elif [ "$PROJECT" -eq 1 ]; then
+        project_progress_init
+        echo "AGENT: project checklist written to .aicli/progress.md"
     fi
     local PLAN
     PLAN="$(printf '%s' "$PLAN_RAW" | perl -0777 -pe 's/<DELIVERABLES>.*?<\/DELIVERABLES>//s')"
@@ -602,6 +745,7 @@ TOOLS - reply with EXACTLY ONE tool call per message. Put the <TOOL> block
 FIRST; short text after it is allowed but the block must come first:
 <TOOL>{"tool": "read", "path": "relative/path"}</TOOL>                    read a file
 <TOOL>{"tool": "write", "path": "relative/path", "content": "..."}</TOOL>   create/overwrite a whole file
+<TOOL>{"tool": "append", "path": "relative/path", "content": "..."}</TOOL>  append to an existing file
 <TOOL>{"tool": "ls", "path": "relative/dir"}</TOOL>                       list a directory
 <TOOL>{"tool": "run", "command": "shell command"}</TOOL>                   run a shell command
 <TOOL>{"tool": "done", "summary": "..."}</TOOL>                            finish (only when ALL deliverables exist)
@@ -616,8 +760,25 @@ EXAMPLE:
 <TOOL>{"tool": "write", "path": "hello.sh", "content": "#!/bin/bash\necho hi\n"}</TOOL>
 SYS_EOF
 )"
+    if [ "$PROJECT" -eq 1 ]; then
+        SYS+="$(cat <<'SYS_EOF'
 
-    echo "AGENT phase 2/3: builder ($BUILD_M) working (mode=$MODE, max_steps=$MAX_STEPS)..."
+PROJECT MODE - build section by section, checking each off:
+<TOOL>{"tool": "progress", "path": "relative/path", "section": "section name"}</TOOL>  check off a finished section
+Work ONE section at a time, top to bottom from PROGRESS:
+1. read the file's current content, so the new section fits what exists,
+2. write the file (first section) or append to it (later sections),
+3. call progress to check the section off.
+A section is done when its content is fully written - not when you plan it.
+Call done ONLY when every box in PROGRESS is checked; the harness rejects
+early done calls and lists what remains.
+SYS_EOF
+)"
+    fi
+
+    local _pmodesuffix=""
+    [ "$PROJECT" -eq 1 ] && _pmodesuffix=", project mode"
+    echo "AGENT phase 2/3: builder ($BUILD_M) working (mode=$MODE, max_steps=$MAX_STEPS$_pmodesuffix)..."
 
     while [ "$finished" -eq 0 ]; do
         local done_flag=0
@@ -695,11 +856,50 @@ SYS_EOF
                                 mkdir -p "$PROJ/$(dirname "$sp")"
                                 printf '%s\n' "$a2" > "$PROJ/$sp"
                                 CHANGED+=("$sp")
-                                agent_mark_done "$sp"
+                                [ "$PROJECT" -eq 0 ] && agent_mark_done "$sp"
                                 tool_result="wrote $sp"
                             fi
                         else
                             tool_result="ERROR: path rejected (must be relative, no ..): $a1"
+                        fi ;;
+                    append)
+                        if sp="$(sanitize_relpath "$a1")"; then
+                            local whash
+                            whash="$(printf '%s' "$sp:$a2" | cksum | cut -d' ' -f1)"
+                            if [ "$whash" = "$LAST_WHASH" ]; then
+                                SAME_WRITE_COUNT=$((SAME_WRITE_COUNT + 1))
+                            else
+                                SAME_WRITE_COUNT=0
+                            fi
+                            LAST_WHASH="$whash"
+                            if [ "$SAME_WRITE_COUNT" -ge 2 ]; then
+                                tool_result="STOP: you have appended identical content to $sp three times in a row. Check it off with progress and move on."
+                                SAME_WRITE_COUNT=0
+                            elif [ "$MODE" = "dry-run" ]; then
+                                tool_result="dry-run: would append ${#a2} chars to: $sp (not executed)"
+                            elif [ ! -f "$PROJ/$sp" ]; then
+                                tool_result="ERROR: cannot append to $sp: file does not exist yet. Use write for the first section."
+                            else
+                                printf '%s\n' "$a2" >> "$PROJ/$sp"
+                                case " ${CHANGED[*]} " in *" $sp "*) ;; *) CHANGED+=("$sp");; esac
+                                tool_result="appended ${#a2} chars to $sp"
+                            fi
+                        else
+                            tool_result="ERROR: path rejected (must be relative, no ..): $a1"
+                        fi ;;
+                    progress)
+                        if [ "$PROJECT" -eq 1 ] && sp="$(sanitize_relpath "$a1")"; then
+                            local pm_out pm_rc
+                            pm_out="$(project_progress_mark "$sp" "$a2" 2>&1)"
+                            pm_rc=$?
+                            tool_result="$pm_out"
+                            if [ "$pm_rc" -eq 0 ] && grep -qF -- "- [x] $sp --" "$PROJ/.aicli/progress.md" 2>/dev/null; then
+                                agent_mark_done "$sp"
+                            fi
+                        elif [ "$PROJECT" -eq 1 ]; then
+                            tool_result="ERROR: path rejected (must be relative, no ..): $a1"
+                        else
+                            tool_result="ERROR: the progress tool is only available in --project mode."
                         fi ;;
                     run)
                         if agent_cmd_denied "$a1"; then
@@ -715,7 +915,11 @@ SYS_EOF
                         fi ;;
                     done)
                         local missing
-                        missing="$(agent_deliv_missing)"
+                        if [ "$PROJECT" -eq 1 ]; then
+                            missing="$(project_unchecked)"
+                        else
+                            missing="$(agent_deliv_missing)"
+                        fi
                         if [ -n "$missing" ]; then
                             done_reject_streak=$((done_reject_streak + 1))
                             if [ "$done_reject_streak" -ge 3 ]; then
@@ -731,7 +935,7 @@ SYS_EOF
                             break
                         fi ;;
                     *)
-                        tool_result="ERROR: unknown tool '$tool'. Available: read, write, ls, run, done." ;;
+                        tool_result="ERROR: unknown tool '$tool'. Available: read, write, append, ls, run, progress, done." ;;
                 esac
                 # Cap giant outputs so history can't blow the context window.
                 tool_result="$(printf '%s' "$tool_result" | head -c "$OUT_CHARS")"
@@ -783,6 +987,9 @@ Task: $TASK
 
 Deliverables:
 $(agent_deliv_status)"
+        if [ "$PROJECT" -eq 1 ]; then
+            REV_PROMPT+="${NL}${NL}Section checklist (every box must be checked):${NL}$(cat "$PROJ/.aicli/progress.md" 2>/dev/null)"
+        fi
         local f
         for f in "${CHANGED[@]}"; do
             REV_PROMPT="${REV_PROMPT}${NL}--- file: $f ---${NL}$(head -c "$OUT_CHARS" "$PROJ/$f")"
@@ -814,7 +1021,11 @@ $(agent_deliv_status)"
     done
 
     local missing_count
-    missing_count="$(agent_deliv_missing | wc -l)"
+    if [ "$PROJECT" -eq 1 ]; then
+        missing_count="$(project_unchecked | wc -l)"
+    else
+        missing_count="$(agent_deliv_missing | wc -l)"
+    fi
     echo
     echo "AGENT: run complete ($step steps, ${#CHANGED[@]} files changed, $missing_count deliverables missing)."
 }
@@ -872,6 +1083,7 @@ TOOLS - to act, include one or more <TOOL> blocks in your reply (they run in
 order, then you get the results and reply again):
 <TOOL>{"tool": "read", "path": "relative/path"}</TOOL>                     read a file
 <TOOL>{"tool": "write", "path": "relative/path", "content": "..."}</TOOL>  create/overwrite a whole file
+<TOOL>{"tool": "append", "path": "relative/path", "content": "..."}</TOOL> append to an existing file
 <TOOL>{"tool": "ls", "path": "relative/dir"}</TOOL>                      list a directory
 <TOOL>{"tool": "run", "command": "shell command"}</TOOL>                  run a shell command
 <TOOL>{"tool": "remember", "scope": "project", "fact": "..."}</TOOL>     remember a durable fact (scope: project or global)

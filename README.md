@@ -48,7 +48,7 @@ it; either way they end up running the same code.
 | `aicli ask` / `ai` | Sends one prompt to the model and prints the answer. Your terminal Q&A. |
 | `aicli arch` / `aarch` | Asks the model to act as a software architect: blueprint + JSON file tree for a project idea. |
 | `aicli build` / `abuild` | Two-phase autonomous builder: first the model plans the project as a JSON file list, then `aicli` loops over that list, generating each file with the previously generated files fed back in as context. |
-| `aicli agent` / `aagent` | Sandboxed multi-model agent: an architect model plans, a builder model works the filesystem with tools (`read`/`write`/`ls`/`run`/`done`), and a reviewer model critiques the result and sends it back for fixes. |
+| `aicli agent` / `aagent` | Sandboxed multi-model agent: an architect model plans, a builder model works the filesystem with tools (`read`/`write`/`append`/`ls`/`run`/`done`), and a reviewer model critiques the result and sends it back for fixes. |
 | `aicli model` | Lists downloaded Ollama models, shows the active one, switches it (pulling it first if needed). |
 | `aicli config` | Shows/changes settings like the active model and the build context window. |
 
@@ -275,6 +275,36 @@ compensates, so you don't have to babysit:
   a row aborts with a suggestion to use a larger model.
 - **Forgiving parser** — slightly malformed tool calls (JSON wrapped in prose) are
   recovered automatically instead of failing the step.
+
+#### Project mode: `aagent --project`
+
+For multi-file builds, `--project` switches the agent from file-at-a-time to
+**section-by-section** construction:
+
+```bash
+aagent --project "Build a blog with index, archive, and post pages plus shared CSS"
+```
+
+The architect breaks every deliverable into 2–5 ordered sections, and the harness writes
+them to `.aicli/progress.md` — a checklist the builder works top to bottom. Two new
+tools make the loop work:
+
+- `append` — adds a section to an existing file (refused if the file doesn't exist yet,
+  so the model can't append onto nothing). Also available in `--chat` and plain
+  one-shot mode.
+- `progress` — checks a section off in `.aicli/progress.md`. The file is
+  harness-owned: the model signals via the tool, and the harness flips the box, so a
+  weak model can't corrupt the format or fake completion.
+
+The builder's discipline per section: `read` the file's current content, `write` (first
+section) or `append` (later sections), then `progress` to check it off. `done` is gated
+on **zero unchecked boxes** — an early `done` is rejected with the remaining sections
+listed. The reviewer also sees the section checklist. Default `--max-steps` rises to 40
+in project mode (overridable).
+
+Because the checklist lives on disk rather than in context, the model can't lose its
+place on long builds — this is the mechanism that lets a 14B model reliably finish
+work that used to stall, loop, or end in placeholders.
 
 **Model size matters more than anything else here.** A 7B coder model can run the agent
 loop, but it will need the guardrails above to finish real tasks. For noticeably better
