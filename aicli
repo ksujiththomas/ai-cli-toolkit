@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.9.2 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.2)"
+VERSION="2.9.3 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.3)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.
@@ -1154,6 +1154,14 @@ SYS_EOF
                             fi
                             if [ "$pm_rc" -eq 0 ] && grep -qF -- "- [x] $sp --" "$PROJ/.aicli/progress.md" 2>/dev/null; then
                                 agent_mark_done "$sp"
+                            fi
+                            # v1.5.3: all sections checked -> finish the builder right away.
+                            # The model reliably drives progress to N/N but never calls done;
+                            # waiting for it just burns steps on re-verification spins.
+                            if [ "$pm_rc" -eq 0 ] && [ -z "$(project_unchecked)" ]; then
+                                echo "AGENT: all project sections checked - builder finished."
+                                done_flag=1
+                                break
                             fi
                         elif [ "$PROJECT" -eq 1 ]; then
                             tool_result="ERROR: path rejected (must be relative, no ..): $a1"
