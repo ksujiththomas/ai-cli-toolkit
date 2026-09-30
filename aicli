@@ -87,7 +87,7 @@ save_config() {
     mv "$tmp" "$CONFIG_FILE"
 }
 
-VERSION="2.9.4 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.4)"
+VERSION="2.9.6 (ai v1.0.0 | aarch v1.0.0 | abuild v1.6.0 | aagent v1.5.4)"
 
 # ---------------------------------------------------------------------------
 # Alias dispatch: `ai`, `aarch`, `abuild` are symlinks to this script.

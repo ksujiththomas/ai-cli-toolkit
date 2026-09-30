@@ -306,6 +306,34 @@ Because the checklist lives on disk rather than in context, the model can't lose
 place on long builds — this is the mechanism that lets a 14B model reliably finish
 work that used to stall, loop, or end in placeholders.
 
+#### Manual plan: `aagent --project --plan-file <file>`
+
+When the architect is the bottleneck -- a small local model that plans too slowly
+or unreliably for a complex task -- skip it and hand the builder your own checklist:
+
+```bash
+aagent --project --plan-file /tmp/phase-basic-plan.md
+```
+
+The file uses the same format as `.aicli/progress.md`: top-level
+`- [ ] <path> -- <purpose>` lines become the sections (and populate the
+deliverables list behind the `done` gate), with `  - [ ]` sub-items for the
+checkable details:
+
+```markdown
+# Build progress
+- [ ] index.html -- homepage
+  - [ ] head: meta charset, viewport, title, stylesheet link
+  - [ ] hero: video autoplay muted loop playsinline src assets/hero-video.mp4
+- [ ] styles.css -- site styling
+  - [ ] :root variables, box-sizing reset, body font and colors
+```
+
+The harness copies your file to `.aicli/progress.md` and the builder works it top
+to bottom exactly like an architect-produced plan. The plan critique loop is also
+skipped -- your checklist is used as written. Reach for this when you know exactly
+what you want built, or when the architect model is too slow for the job.
+
 #### Thorough mode: `aagent --project --thorough`
 
 When quality matters more than speed, `--thorough` gives both the architect and the
@@ -563,7 +591,7 @@ please run `shellcheck` and `bash -n` on the script before submitting.
 ## Versioning
 
 This project follows [Semantic Versioning](https://semver.org). Check the repository
-tags for releases (current stable: v2.3.1).
+tags for releases (current: v2.9.6).
 
 ---
 
