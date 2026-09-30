@@ -886,6 +886,10 @@ AP_EOF
             echo "AGENT: --no-review given; the architect will critique its own plan."
         fi
         local crit_round=0 crit_done=0
+        if [ -n "$PLAN_FILE" ]; then
+            echo "AGENT: skipping plan critique (manual plan file provided)."
+            crit_done=1
+        fi
         while [ "$crit_round" -lt 3 ] && [ "$crit_done" -eq 0 ]; do
             crit_round=$((crit_round + 1))
             PLAN_CRIT_ROUNDS="$crit_round"
