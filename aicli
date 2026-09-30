@@ -427,6 +427,7 @@ cmd_agent() {
     local HIST_KEPT="$AGENT_HISTORY_KEPT"
     local DO_REVIEW=1
     local CHAT=0 MAX_STEPS_SET=0 MAX_REV_SET=0 PROJECT=0 THOROUGH=0
+    local PLAN_FILE=""
     local NL=$'\n'
 
     local -a CHANGED=() HIST=()
@@ -459,6 +460,9 @@ cmd_agent() {
             --no-review) DO_REVIEW=0; shift ;;
             --project) PROJECT=1; shift ;;
             --thorough) THOROUGH=1; shift ;;
+            --plan-file)
+                [ $# -ge 2 ] || { echo "Flag --plan-file needs a value." >&2; return 1; }
+                PLAN_FILE="$2"; shift 2 ;;
             --chat) CHAT=1; shift ;;
             --) shift; break ;;
             -*) echo "Unknown agent flag: $1" >&2; return 1 ;;
@@ -826,6 +830,26 @@ AP_EOF
     fi
     echo "AGENT: loading $ARCH_M (first load from disk can take a minute)..."
     local PLAN_RAW="" _arch_try=0 _arch_ok=0
+    if [ -n "$PLAN_FILE" ]; then
+        if [ -f "$PLAN_FILE" ]; then
+            mkdir -p "$PROJ/.aicli"
+            cp "$PLAN_FILE" "$PROJ/.aicli/progress.md"
+            echo "AGENT: using provided plan file $PLAN_FILE (architect skipped)."
+            _arch_ok=1
+            # Populate DELIV arrays from the plan file for the done-gate
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^-\ \[\ \]\ ([^\ ]+)\ --\ (.*)$ ]]; then
+                    DELIV_PATHS+=("${BASH_REMATCH[1]}")
+                    DELIV_PURPOSE+=("${BASH_REMATCH[2]}")
+                    DELIV_DONE+=(0)
+                    DELIV_SECS+=("")
+                fi
+            done < "$PROJ/.aicli/progress.md"
+        else
+            echo "AGENT error: plan file not found: $PLAN_FILE" >&2
+            return 1
+        fi
+    fi
     while [ "$_arch_try" -lt 3 ] && [ "$_arch_ok" -eq 0 ]; do
         _arch_try=$((_arch_try + 1))
         local _arch_extra=""
