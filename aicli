@@ -86,6 +86,24 @@ fi
 # and tail (error/result) instead of just cutting the tail. Better for
 # debugging: the model sees both what ran and how it failed.
 # $1 = text, $2 = max chars. Prints truncated text.
+# v2.11: syntax-validate a written file. Returns 0 if clean, 1 if errors.
+# $1 = full file path. Prints error output on failure.
+_validate_syntax() {
+    local _f="$1" _err=""
+    case "$_f" in
+        *.sh|*.bash)
+            _err="$(bash -n "$_f" 2>&1)" || { printf '%s' "$_err"; return 1; }
+            ;;
+        *.py)
+            _err="$(python3 -m py_compile "$_f" 2>&1)" || { printf '%s' "$_err"; return 1; }
+            ;;
+        *.js|*.mjs)
+            _err="$(node --check "$_f" 2>&1)" || { printf '%s' "$_err"; return 1; }
+            ;;
+    esac
+    return 0
+}
+
 _truncate_middle() {
     local text="$1" max="${2:-1500}"
     local len=${#text}
@@ -1202,6 +1220,14 @@ SYS_EOF
                             else
                                 mkdir -p "$PROJ/$(dirname "$sp")"
                                 printf '%s\n' "$a2" > "$PROJ/$sp"
+                                # v2.11: syntax-validate after write. If broken,
+                                # feed the error back so the model fixes it
+                                # instead of moving on with a broken file.
+                                _syn_err="$(_validate_syntax "$PROJ/$sp" 2>&1)"
+                                if [ $? -ne 0 ]; then
+                                    tool_result="SYNTAX ERROR in $sp:${NL}${_syn_err}${NL}${NL}Fix the syntax error and write the corrected file."
+                                    _skip_dispatch=1
+                                else
                                 CHANGED+=("$sp")
                                 [ "$PROJECT" -eq 0 ] && agent_mark_done "$sp"
                                 if [ "$PROJECT" -eq 1 ]; then
@@ -1209,6 +1235,7 @@ SYS_EOF
                                     [ -z "${SECT_START[$_sect_stamp_key]+x}" ] && SECT_START["$_sect_stamp_key"]=$SECONDS
                                 fi
                                 tool_result="wrote $sp"
+                                fi  # end v2.11 syntax-check else block
                                 if [ "$PROJECT" -eq 1 ]; then
                                     _open="$(project_open_sections "$sp")"
                                     if [ -n "$_open" ]; then
