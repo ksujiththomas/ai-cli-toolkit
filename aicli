@@ -60,6 +60,45 @@ AGENT_MAX_OUTPUT_CHARS=4000 # truncate individual tool outputs to this
 AGENT_CMD_TIMEOUT=60        # seconds: per shell command run by the agent
 AGENT_MODEL_TIMEOUT=300     # seconds: per model call timeout
 AGENT_HISTORY_KEPT=6        # builder prompt keeps this many recent tool exchanges verbatim
+AGENT_MAX_PROMPT_TOKENS=3500 # hard ceiling: prompt trimmed if estimated tokens exceed this
+
+# v2.10: hardware-adaptive defaults for constrained VRAM (e.g. GTX 1070 8GB).
+# When the builder model is a 7b-class or smaller, tighten the prompt budget
+# to fit within a 4k context window. Override via config.env or env vars.
+_agent_model_size_hint() {
+    # $1 = model name. Matches: :0.5b, :1.5b, :3b, :7b, llama3.2:3b, qwen2.5-coder:7b
+    # Skips: :14b, :32b, :70b
+    local _m="${1:-}"
+    if [[ "$_m" =~ (^|[^0-9])([0-7](\.[0-9]+)?)b([^0-9]|$) ]]; then
+        printf 'small'
+    else
+        printf 'large'
+    fi
+}
+# NOTE: BUILD_M is only set inside cmd_agent; at init time use BUILDER_MODEL
+# (the config default). Per-run --builder-model overrides are handled below.
+if [ "$(_agent_model_size_hint "${BUILDER_MODEL:-}")" = "small" ]; then
+    AGENT_HISTORY_KEPT=3         # 6 exchanges -> 3 (saves ~3k tokens worst-case)
+    AGENT_MAX_OUTPUT_CHARS=1500  # 4000 -> 1500 chars per tool output
+fi
+
+# v2.10: middle-truncation for tool outputs. Keeps the head (command context)
+# and tail (error/result) instead of just cutting the tail. Better for
+# debugging: the model sees both what ran and how it failed.
+# $1 = text, $2 = max chars. Prints truncated text.
+_truncate_middle() {
+    local text="$1" max="${2:-1500}"
+    local len=${#text}
+    if [ "$len" -le "$max" ]; then
+        printf '%s' "$text"
+        return 0
+    fi
+    local head_chars=$(( max * 30 / 100 ))
+    local tail_chars=$(( max - head_chars - 30 ))  # 30 for marker
+    local head_part="${text:0:$head_chars}"
+    local tail_part="${text:$(( len - tail_chars ))}"
+    printf '%s\n[... %d chars truncated ...]\n%s' "$head_part" "$(( len - max ))" "$tail_part"
+}
 CHAT_HISTORY_TURNS=10       # chat: conversation turns kept in each prompt
 CHAT_MAX_STEPS=15           # chat: max tool steps per turn before the model must reply
 
@@ -416,7 +455,7 @@ chat_exec_tool() {
         *)
             TOOL_RESULT="ERROR: unknown tool '$tool'. Available: read, write, append, ls, run, remember." ;;
     esac
-    TOOL_RESULT="$(printf '%s' "$TOOL_RESULT" | head -c "$OUT_CHARS")"
+    TOOL_RESULT="$(_truncate_middle "$TOOL_RESULT" "$OUT_CHARS")"
 }
 
 # aicli agent [--flags] "task description"
@@ -471,6 +510,13 @@ cmd_agent() {
     done
 
     local TASK="$*"
+
+    # v2.10: re-evaluate adaptive defaults after arg parsing, in case
+    # --builder-model overrode the config default.
+    if [ "$(_agent_model_size_hint "$BUILD_M")" = "small" ]; then
+        AGENT_HISTORY_KEPT=3
+        AGENT_MAX_OUTPUT_CHARS=1500
+    fi
     if [ "$CHAT" -eq 1 ]; then
         # Interactive mode: remaining args (if any) are the opening message.
         local CHAT_STEPS="$CHAT_MAX_STEPS"
@@ -733,13 +779,38 @@ PYEOF2
         else
             p+="${NL}${NL}DELIVERABLES (create every MISSING one):${NL}$(agent_deliv_status)"
         fi
-        p+="${NL}${NL}PLAN:${NL}${PLAN}"
+        # v2.10: only inject PLAN on step 1. After that, history retains it.
+        # Saves ~500-2000 tokens/turn on constrained hardware.
+        if [ "$step" -le 1 ]; then
+            p+="${NL}${NL}PLAN:${NL}${PLAN}"
+        fi
         p+="${NL}${NL}RECENT HISTORY (most recent last):${NL}$(agent_render_history)"
         if [ -n "$1" ]; then
             p+="${NL}${NL}LAST TOOL RESULT:${NL}$1"
         fi
         p+="${NL}${NL}Reply with exactly one <TOOL> block first."
-        printf '%s' "$p"
+        # v2.10: enforce token budget before returning.
+        agent_enforce_token_budget "$p" "${AGENT_MAX_PROMPT_TOKENS:-3500}"
+    }
+
+    # v2.10: estimate tokens as chars/4 (conservative for code-heavy prompts).
+    # Trims prompt components by priority if over budget.
+    agent_enforce_token_budget() {
+        local prompt="$1" max_tokens="${2:-3500}"
+        local est=$(( ${#prompt} / 4 ))
+        if [ "$est" -le "$max_tokens" ]; then
+            printf '%s' "$prompt"
+            return 0
+        fi
+        local trimmed
+        trimmed="$(printf '%s' "$prompt" | perl -0777 -pe 's/\n\nPLAN:\n.*?\n\nRECENT HISTORY/\n\nRECENT HISTORY/s')"
+        est=$(( ${#trimmed} / 4 ))
+        if [ "$est" -le "$max_tokens" ]; then
+            printf '%s' "$trimmed"
+            return 0
+        fi
+        printf '%s' "${trimmed:0:$(( max_tokens * 4 ))}"
+        return 0
     }
     # Fingerprint of current outputs: detects revision rounds with no progress.
     agent_state_sig() {
@@ -1271,7 +1342,7 @@ SYS_EOF
                 esac
                 fi # _skip_dispatch: loop-warning replaces the tool result
                 # Cap giant outputs so history can't blow the context window.
-                tool_result="$(printf '%s' "$tool_result" | head -c "$OUT_CHARS")"
+                tool_result="$(_truncate_middle "$tool_result" "$OUT_CHARS")"
                 printf '  < %s\n' "$(printf '%s' "$tool_result" | head -n 1 | head -c 160)"
             fi
 
@@ -1329,7 +1400,7 @@ $(agent_deliv_status)"
         fi
         local f
         for f in "${CHANGED[@]}"; do
-            REV_PROMPT="${REV_PROMPT}${NL}--- file: $f ---${NL}$(head -c "$OUT_CHARS" "$PROJ/$f")"
+            REV_PROMPT="${REV_PROMPT}${NL}--- file: $f ---${NL}$(_truncate_middle "$(cat "$PROJ/$f")" "$OUT_CHARS")"
         done
 
         local vresp vjson verdict="approve" notes=""
