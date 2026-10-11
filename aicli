@@ -799,6 +799,11 @@ PYEOF2
             p+="${NL}${NL}PROGRESS (check sections off with the progress tool, top to bottom):${NL}$(cat "$PROJ/.aicli/progress.md" 2>/dev/null)"
         else
             p+="${NL}${NL}DELIVERABLES (create every MISSING one):${NL}$(agent_deliv_status)"
+            # v2.13: 7b gets stuck in ls/read loops without ever writing.
+            # Force the first action to be a write of the top missing file.
+            if [ "$step" -le 1 ]; then
+                p+="${NL}${NL}IMPORTANT: Your FIRST tool call MUST be 'write' to create the first MISSING deliverable listed above. Do NOT call ls, read, or any other tool first. Write the file now."
+            fi
         fi
         # v2.10: only inject PLAN on step 1. After that, history retains it.
         # Saves ~500-2000 tokens/turn on constrained hardware.
