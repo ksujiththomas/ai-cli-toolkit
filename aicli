@@ -496,6 +496,8 @@ cmd_agent() {
     local LAST_WHASH="" SAME_WRITE_COUNT=0
     local CHURN_FILE="" CHURN_N=0
     local tool_result="" prev_sig=""
+    # v2.14: per-file mode state
+    local PER_FILE=0 CURRENT_TARGET=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -537,6 +539,10 @@ cmd_agent() {
     if [ "$(_agent_model_size_hint "$BUILD_M")" = "small" ]; then
         AGENT_HISTORY_KEPT=3
         AGENT_MAX_OUTPUT_CHARS=1500
+        # v2.14: per-file builder mode for small models. Instead of one
+        # builder loop juggling multiple files (7b gets lost), run a
+        # separate focused builder invocation per deliverable file.
+        PER_FILE=1
     fi
     if [ "$CHAT" -eq 1 ]; then
         # Interactive mode: remaining args (if any) are the opening message.
@@ -605,6 +611,21 @@ cmd_agent() {
             printf '  (no deliverables list; use your best judgment)\n'
             return
         fi
+        # v2.14: per-file mode — show only the current target, not all missing.
+        # This keeps 7b focused on one file instead of getting lost.
+        if [ "$PER_FILE" -eq 1 ] && [ -n "$CURRENT_TARGET" ]; then
+            for i in "${!DELIV_PATHS[@]}"; do
+                if [ "${DELIV_PATHS[$i]}" = "$CURRENT_TARGET" ]; then
+                    if [ "${DELIV_DONE[$i]}" = "1" ]; then
+                        printf '  [done] %s\n' "${DELIV_PATHS[$i]}"
+                    else
+                        printf '  [CURRENT TASK] %s -- %s\n' "${DELIV_PATHS[$i]}" "${DELIV_PURPOSE[$i]}"
+                        printf '  Focus ONLY on creating this one file. Ignore all other deliverables for now.\n'
+                    fi
+                    return
+                fi
+            done
+        fi
         for i in "${!DELIV_PATHS[@]}"; do
             if [ "${DELIV_DONE[$i]}" = "1" ]; then
                 printf '  [done] %s\n' "${DELIV_PATHS[$i]}"
@@ -612,6 +633,33 @@ cmd_agent() {
                 printf '  [MISSING] %s -- %s\n' "${DELIV_PATHS[$i]}" "${DELIV_PURPOSE[$i]}"
             fi
         done
+    }
+
+    # v2.14: advance CURRENT_TARGET to the next missing deliverable.
+    # Called after each successful write in per-file mode.
+    agent_advance_target() {
+        [ "$PER_FILE" -eq 1 ] || return 0
+        local i
+        for i in "${!DELIV_PATHS[@]}"; do
+            if [ "${DELIV_DONE[$i]}" != "1" ] && [ -f "$PROJ/${DELIV_PATHS[$i]}" ]; then
+                # File exists on disk but not marked done — mark it
+                DELIV_DONE[$i]=1
+            fi
+            if [ "${DELIV_DONE[$i]}" != "1" ]; then
+                CURRENT_TARGET="${DELIV_PATHS[$i]}"
+                echo "AGENT: per-file mode — now targeting: $CURRENT_TARGET" >&2
+                return 0
+            fi
+        done
+        CURRENT_TARGET=""
+    }
+
+    # v2.14: initialize per-file targeting after architect phase.
+    # Sets CURRENT_TARGET to the first missing deliverable.
+    agent_init_per_file() {
+        [ "$PER_FILE" -eq 1 ] || return 0
+        [ "${#DELIV_PATHS[@]}" -eq 0 ] && return 0
+        agent_advance_target
     }
     agent_deliv_missing() {
         local i
@@ -974,6 +1022,9 @@ AP_EOF
         echo "AGENT: project checklist written to .aicli/progress.md"
     fi
 
+    # v2.14: initialize per-file targeting after architect produces deliverables
+    agent_init_per_file
+
     # ---- Phase 1b: thorough plan critique loop ----
     local PLAN_CRIT_ROUNDS=0
     if [ "$THOROUGH" -eq 1 ] && [ "${#DELIV_PATHS[@]}" -gt 0 ]; then
@@ -1244,6 +1295,8 @@ SYS_EOF
                                 fi
                                 tool_result="wrote $sp"
                                 fi  # end v2.11 syntax-check else block
+                                # v2.14: in per-file mode, advance to next target after write
+                                agent_advance_target
                                 if [ "$PROJECT" -eq 1 ]; then
                                     _open="$(project_open_sections "$sp")"
                                     if [ -n "$_open" ]; then
