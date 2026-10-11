@@ -60,6 +60,24 @@ AGENT_MAX_OUTPUT_CHARS=4000 # truncate individual tool outputs to this
 AGENT_CMD_TIMEOUT=60        # seconds: per shell command run by the agent
 AGENT_MODEL_TIMEOUT=300     # seconds: per model call timeout
 AGENT_HISTORY_KEPT=6        # builder prompt keeps this many recent tool exchanges verbatim
+AGENT_MAX_PROMPT_TOKENS=3500 # hard ceiling: prompt trimmed if estimated tokens exceed this
+
+# v2.10: hardware-adaptive defaults for constrained VRAM (e.g. GTX 1070 8GB).
+# When the builder model is a 7b-class or smaller, tighten the prompt budget
+# to fit within a 4k context window. Override via config.env or env vars.
+_agent_model_size_hint() {
+    # Matches: :0.5b, :1.5b, :3b, :7b, llama3.2:3b, qwen2.5-coder:7b
+    # Skips: :14b, :32b, :70b
+    if [[ "$BUILD_M" =~ (^|[^0-9])([0-7](\.[0-9]+)?)b([^0-9]|$) ]]; then
+        printf 'small'
+    else
+        printf 'large'
+    fi
+}
+if [ "$(_agent_model_size_hint)" = "small" ]; then
+    AGENT_HISTORY_KEPT=3         # 6 exchanges -> 3 (saves ~3k tokens worst-case)
+    AGENT_MAX_OUTPUT_CHARS=1500  # 4000 -> 1500 chars per tool output
+fi
 CHAT_HISTORY_TURNS=10       # chat: conversation turns kept in each prompt
 CHAT_MAX_STEPS=15           # chat: max tool steps per turn before the model must reply
 
@@ -733,13 +751,43 @@ PYEOF2
         else
             p+="${NL}${NL}DELIVERABLES (create every MISSING one):${NL}$(agent_deliv_status)"
         fi
-        p+="${NL}${NL}PLAN:${NL}${PLAN}"
+        # v2.10: only inject PLAN on step 1. After that, history retains it.
+        # Saves ~500-2000 tokens/turn on constrained hardware.
+        if [ "$step" -le 1 ]; then
+            p+="${NL}${NL}PLAN:${NL}${PLAN}"
+        fi
         p+="${NL}${NL}RECENT HISTORY (most recent last):${NL}$(agent_render_history)"
         if [ -n "$1" ]; then
             p+="${NL}${NL}LAST TOOL RESULT:${NL}$1"
         fi
         p+="${NL}${NL}Reply with exactly one <TOOL> block first."
-        printf '%s' "$p"
+        # v2.10: enforce token budget before returning.
+        agent_enforce_token_budget "$p" "${AGENT_MAX_PROMPT_TOKENS:-3500}"
+    }
+
+    # v2.10: estimate tokens as chars/4 (conservative for code-heavy prompts).
+    # Trims prompt components by priority if over budget.
+    # Priority (trim first): plan -> hard truncate as last resort.
+    agent_enforce_token_budget() {
+        # $1 = full prompt string, $2 = max tokens. Prints trimmed prompt.
+        local prompt="$1" max_tokens="${2:-3500}"
+        local est=$(( ${#prompt} / 4 ))
+        if [ "$est" -le "$max_tokens" ]; then
+            printf '%s' "$prompt"
+            return 0
+        fi
+        # Over budget: strip PLAN block first (saves 500-2000 tokens).
+        # This is a safety net; Patch 1 should already handle the common case.
+        local trimmed
+        trimmed="$(printf '%s' "$prompt" | perl -0777 -pe 's/\n\nPLAN:\n.*?\n\nRECENT HISTORY/\n\nRECENT HISTORY/s')"
+        est=$(( ${#trimmed} / 4 ))
+        if [ "$est" -le "$max_tokens" ]; then
+            printf '%s' "$trimmed"
+            return 0
+        fi
+        # Still over: hard truncate (last resort, preserves prompt start).
+        printf '%s' "${trimmed:0:$(( max_tokens * 4 ))}"
+        return 0
     }
     # Fingerprint of current outputs: detects revision rounds with no progress.
     agent_state_sig() {
