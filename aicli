@@ -327,12 +327,15 @@ except Exception:
     sys.exit(2)
 def clean(s):
     return re.sub(r"[|;]", "", str(s)).strip()
+# v2.12: sort code files before docs. 7b tends to write the easy
+# README first then runs out of steps before the real code.
+def _prio(path):
+    _code = (".py", ".sh", ".js", ".ts", ".c", ".h", ".cpp", ".rs", ".go")
+    return 0 if path.lower().endswith(_code) else 1
+items = [it for it in items if isinstance(it, dict) and clean(it.get("path", ""))]
+items.sort(key=lambda it: _prio(clean(it.get("path", ""))))
 for it in items:
-    if not isinstance(it, dict):
-        continue
     p = clean(it.get("path", ""))
-    if not p:
-        continue
     purpose = clean(it.get("purpose", ""))
     secs = it.get("sections", []) or []
     sec_str = ";".join(clean(s) for s in secs if clean(s))
